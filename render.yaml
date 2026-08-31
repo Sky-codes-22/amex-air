@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: amex-air
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: AIR_HEADLESS
+        value: "true"
+      - key: AIR_QUERY_DELAY_SECONDS
+        value: "2"

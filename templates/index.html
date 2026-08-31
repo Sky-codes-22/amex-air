@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Upload query batches and collect Google AI Overview responses into Excel.">
+  <title>AMEX AIR | AI Insights & Responses</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='air.css') }}">
+  <script src="{{ url_for('static', filename='air.js') }}" defer></script>
+</head>
+<body>
+  <header class="brand"><h1>AMEX AIR</h1><p>AI Insights &amp; Responses</p></header>
+  <main class="shell">
+    <section class="panel" aria-labelledby="upload-heading">
+      <div id="upload-view">
+        <p class="eyebrow">GOOGLE AI OVERVIEW COLLECTION</p>
+        <h2 id="upload-heading">Turn query lists into structured insight</h2>
+        <p class="lede">Upload an Excel, CSV, or text file. AMEX AIR searches each query, captures available AI Overviews, and prepares a downloadable workbook.</p>
+        <div class="format-row"><span><b>Excel/CSV</b> Prompt column or first column</span><span><b>Text</b> One query per line</span><span><b>Limit</b> 500 unique queries</span></div>
+        <label class="drop" id="drop-zone">
+          <input id="file-input" type="file" accept=".xlsx,.csv,.txt">
+          <span class="file-mark">AIR</span>
+          <strong>Drop your query file here</strong>
+          <span>or choose a file from your device</span>
+          <span class="selected" id="selected-file">No file selected</span>
+        </label>
+        <div class="error" id="error" role="alert" hidden></div>
+        <button class="primary" id="run" disabled>Run AMEX AIR</button>
+      </div>
+      <div class="processing" id="processing-view" hidden>
+        <div class="orbit" aria-hidden="true"><span></span></div>
+        <p class="eyebrow">COLLECTION IN PROGRESS</p>
+        <h2 id="progress-title">Preparing hosted browser...</h2>
+        <p id="current-query">Your query batch is being prepared.</p>
+        <div class="progress-track"><div id="progress-bar"></div></div>
+        <p class="progress-count" id="progress-count">0 of 0 completed</p>
+        <button class="stop" id="stop">Stop collection</button>
+      </div>
+      <div class="complete" id="complete-view" hidden>
+        <div class="check">✓</div><p class="eyebrow">COLLECTION COMPLETE</p>
+        <h2>Your insight workbook is ready</h2>
+        <p id="summary"></p>
+        <a class="primary link" id="download" href="#">Download Excel results</a>
+        <button class="reset" id="reset">Run another batch</button>
+      </div>
+    </section>
+    <p class="note">AI Overviews vary by query, region, Google availability, and automated-access controls. Missing results and blocks are recorded clearly in the output.</p>
+  </main>
+</body>
+</html>
