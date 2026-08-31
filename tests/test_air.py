@@ -60,6 +60,15 @@ class AirTests(unittest.TestCase):
         self.assertEqual("queued", status["state"])
         self.assertEqual(2, status["total"])
 
+    def test_missing_job_explains_restart_and_is_retryable(self):
+        run_id = "a" * air_app.RUN_ID_LENGTH
+        response = self.client.get(f"/jobs/{run_id}")
+        self.assertEqual(404, response.status_code)
+        payload = response.get_json()
+        self.assertEqual("job_state_lost", payload["code"])
+        self.assertTrue(payload["retryable"])
+        self.assertIn("restarted", payload["error"])
+
     def test_worker_creates_expected_excel(self):
         job_root = Path(self.temp.name) / "job"
         job_root.mkdir()

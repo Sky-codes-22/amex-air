@@ -94,7 +94,15 @@ def create_app(test_config=None):
         root = valid_root(run_id)
         path = root / "status.json"
         if not path.is_file():
-            abort(404)
+            return jsonify(
+                error=(
+                    "This job is no longer available. The hosted service was likely "
+                    "restarted or replaced during processing, which clears temporary "
+                    "job files on the free hosting tier."
+                ),
+                code="job_state_lost",
+                retryable=True,
+            ), 404
         status = json.loads(path.read_text(encoding="utf-8"))
         if status.get("state") in {"completed", "failed", "cancelled"}:
             with LOCK:
