@@ -163,21 +163,21 @@ class JobStore:
             job = session.get(Job, run_id)
             if not job or job.worker_id != worker_id or job.state != "processing":
                 return False
+            job.success_count = int(success_count)
+            job.failed_count = int(failed_count)
+            job.workbook = workbook
             if job.cancel_requested:
                 job.state = "cancelled"
-                job.message = "Collection cancelled."
-                job.workbook = None
+                job.message = "Collection stopped. Partial results are ready to download."
             else:
                 job.state = "completed"
                 job.completed = job.total
-                job.success_count = int(success_count)
-                job.failed_count = int(failed_count)
-                job.workbook = workbook
                 job.message = "AMEX AIR collection complete."
             job.current_query = None
             job.updated_at = utcnow()
+            state = job.state
             session.commit()
-            return True
+            return state
 
     def fail(self, run_id, worker_id, error):
         with Session(self.engine) as session:
@@ -195,7 +195,7 @@ class JobStore:
     def workbook(self, run_id, token):
         with Session(self.engine) as session:
             job = session.get(Job, run_id)
-            if not job or job.download_token != token or job.state != "completed" or not job.workbook:
+            if not job or job.download_token != token or job.state not in {"completed", "cancelled"} or not job.workbook:
                 return None
             return job.workbook, job.filename
 
@@ -215,6 +215,6 @@ class JobStore:
             "created_at": as_utc(job.created_at).isoformat(),
             "updated_at": as_utc(job.updated_at).isoformat(),
         }
-        if job.state == "completed":
+        if job.workbook:
             result["download_token"] = job.download_token
         return result

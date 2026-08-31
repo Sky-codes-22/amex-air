@@ -106,13 +106,15 @@
     counts.className = "counts";
     counts.textContent = job.state === "completed"
       ? `${job.success_count} successful · ${job.failed_count} failed`
-      : `${job.completed} of ${job.total} completed`;
+      : job.state === "cancelled" && job.download_token
+        ? `${job.completed} processed · ${job.success_count} successful · ${job.failed_count} failed`
+        : `${job.completed} of ${job.total} completed`;
     bottom.append(counts);
 
-    if (job.state === "completed" && job.download_token) {
+    if (job.download_token) {
       const download = document.createElement("a");
       download.className = "action";
-      download.textContent = "Download Excel";
+      download.textContent = job.state === "cancelled" ? "Download partial Excel" : "Download Excel";
       download.href = `/jobs/${job.run_id}/download?token=${encodeURIComponent(job.download_token)}`;
       bottom.append(download);
     } else if (["queued", "processing"].includes(job.state)) {

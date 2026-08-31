@@ -8,7 +8,8 @@ AMEX AIR (AI Insights & Responses) is an independent web application for queuein
 2. The hosted application stores the request in a durable database and shows it under **Request status**.
 3. The laptop processing engine claims queued requests whenever it is online.
 4. Progress is sent back to the website after every query.
-5. The completed workbook is stored centrally and becomes downloadable from the same browser.
+5. If a processing request is stopped, the worker finishes the current query, stops Google collection, and makes a partial workbook available.
+6. The completed workbook is stored centrally and becomes downloadable from the same browser.
 
 Request history is associated with a random identity stored in that browser. It is not an account system, so clearing browser storage or using another browser/device will not show the same history.
 

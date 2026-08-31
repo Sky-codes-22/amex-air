@@ -46,6 +46,21 @@ class RemoteWorker:
         )
         return response.json().get("cancel_requested", False)
 
+    def upload_results(self, run_id, rows):
+        with tempfile.TemporaryDirectory(prefix="amex_air_") as directory:
+            output = Path(directory) / "amex_air_results.xlsx"
+            write_results(output, rows)
+            with output.open("rb") as workbook:
+                self.post(
+                    f"/worker/jobs/{run_id}/complete",
+                    data={
+                        "worker_id": self.worker_id,
+                        "success_count": sum(row["status"] == "Success" for row in rows),
+                        "failed_count": sum(row["status"] == "Failed" for row in rows),
+                    },
+                    files={"workbook": ("amex_air_results.xlsx", workbook, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                )
+
     def process(self, job):
         run_id = job["run_id"]
         queries = job["queries"]
@@ -56,29 +71,20 @@ class RemoteWorker:
             for index, query in enumerate(queries, start=1):
                 cancelled = self.update(run_id, index - 1, query, f"Collecting query {index} of {len(queries)} on the laptop...")
                 if cancelled:
-                    print(f"[{run_id}] Cancelled before query {index}.", flush=True)
+                    self.upload_results(run_id, rows)
+                    print(f"[{run_id}] Cancelled before query {index}; uploaded {len(rows)} partial results.", flush=True)
                     return
                 result = collector.collect(query)
                 rows.append({"prompt": query, **result})
                 cancelled = self.update(run_id, index, query, f"Completed query {index} of {len(queries)}.")
                 if cancelled:
-                    print(f"[{run_id}] Cancelled after query {index}.", flush=True)
+                    self.upload_results(run_id, rows)
+                    print(f"[{run_id}] Cancelled after query {index}; uploaded {len(rows)} partial results.", flush=True)
                     return
                 if delay and index < len(queries):
                     time.sleep(delay)
-            with tempfile.TemporaryDirectory(prefix="amex_air_") as directory:
-                output = Path(directory) / "amex_air_results.xlsx"
-                write_results(output, rows)
-                with output.open("rb") as workbook:
-                    self.post(
-                        f"/worker/jobs/{run_id}/complete",
-                        data={
-                            "worker_id": self.worker_id,
-                            "success_count": sum(row["status"] == "Success" for row in rows),
-                            "failed_count": sum(row["status"] == "Failed" for row in rows),
-                        },
-                        files={"workbook": ("amex_air_results.xlsx", workbook, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                    )
+            self.upload_results(run_id, rows)
+
             print(f"[{run_id}] Completed {len(queries)} queries.", flush=True)
         except BaseException as error:
             detail = f"{type(error).__name__}: {error}"

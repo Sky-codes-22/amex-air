@@ -90,7 +90,7 @@ def create_app(test_config=None):
         job = store.get_job(valid_run_id(run_id), client_id())
         if not job:
             abort(404)
-        if job["state"] == "completed":
+        if job.get("download_token"):
             job["download_url"] = url_for("download", run_id=run_id, token=job.pop("download_token"))
         return jsonify(job)
 
@@ -164,16 +164,16 @@ def create_app(test_config=None):
         upload = request.files.get("workbook")
         if not upload:
             return jsonify(error="A completed workbook is required."), 400
-        ok = store.complete(
+        state = store.complete(
             valid_run_id(run_id),
             request.form.get("worker_id", "")[:80],
             workbook=upload.read(),
             success_count=request.form.get("success_count", 0),
             failed_count=request.form.get("failed_count", 0),
         )
-        if not ok:
+        if not state:
             abort(409)
-        return jsonify(state="completed")
+        return jsonify(state=state)
 
     @app.post("/worker/jobs/<run_id>/fail")
     def worker_fail(run_id):

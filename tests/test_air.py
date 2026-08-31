@@ -112,8 +112,30 @@ class AirTests(unittest.TestCase):
         self.assertEqual("cancelled", queued["state"])
         processing_id = self.upload(b"processing").get_json()["job"]["run_id"]
         self.client.post("/worker/claim", json={"worker_id": "laptop"}, headers=self.worker_headers)
+        self.client.post(
+            f"/worker/jobs/{processing_id}/progress",
+            json={"worker_id": "laptop", "completed": 1, "current_query": "processing", "message": "One done."},
+            headers=self.worker_headers,
+        )
         processing = self.client.post(f"/jobs/{processing_id}/cancel", headers=self.client_headers).get_json()["job"]
         self.assertTrue(processing["cancel_requested"])
+        partial = self.client.post(
+            f"/worker/jobs/{processing_id}/complete",
+            data={
+                "worker_id": "laptop",
+                "success_count": "1",
+                "failed_count": "0",
+                "workbook": (io.BytesIO(b"partial-workbook"), "results.xlsx"),
+            },
+            content_type="multipart/form-data",
+            headers=self.worker_headers,
+        )
+        self.assertEqual("cancelled", partial.get_json()["state"])
+        job = self.client.get(f"/jobs/{processing_id}", headers=self.client_headers).get_json()
+        self.assertEqual("cancelled", job["state"])
+        self.assertEqual(1, job["completed"])
+        self.assertIn("Partial results", job["message"])
+        self.assertEqual(b"partial-workbook", self.client.get(job["download_url"]).data)
 
     def test_laptop_worker_builds_and_uploads_workbook(self):
         from unittest.mock import MagicMock, patch
@@ -138,6 +160,35 @@ class AirTests(unittest.TestCase):
         self.assertEqual("/worker/jobs/cccccccccccccccccccccccccccccccc/complete", uploads[0][0])
         workbook = load_workbook(io.BytesIO(uploads[0][2]), read_only=True, data_only=True)
         self.assertEqual("answer: one", workbook["Responses"]["C2"].value)
+        workbook.close()
+
+    def test_laptop_worker_uploads_partial_workbook_when_cancelled(self):
+        from unittest.mock import MagicMock, patch
+
+        collected = []
+
+        class FakeCollector:
+            def collect(self, query):
+                collected.append(query)
+                return {"status": "Success", "response": f"answer: {query}", "parsed_json": "{}", "execution_time": 0.1}
+
+        worker = RemoteWorker("https://example.test", "secret", worker_id="laptop")
+        uploads = []
+        worker.update = lambda _run_id, completed, _query, _message: completed == 1
+
+        def capture(path, **kwargs):
+            uploads.append((path, kwargs["data"], kwargs["files"]["workbook"][1].read()))
+            return MagicMock()
+
+        worker.post = capture
+        with patch("air.remote_worker.GoogleAIOverviewCollector", FakeCollector), patch.dict("os.environ", {"AIR_QUERY_DELAY_SECONDS": "0"}):
+            worker.process({"run_id": "p" * 32, "filename": "queries.txt", "queries": ["one", "two", "three"]})
+        self.assertEqual(["one"], collected)
+        self.assertEqual("/worker/jobs/pppppppppppppppppppppppppppppppp/complete", uploads[0][0])
+        self.assertEqual("1", str(uploads[0][1]["success_count"]))
+        workbook = load_workbook(io.BytesIO(uploads[0][2]), read_only=True, data_only=True)
+        self.assertEqual(2, workbook["Responses"].max_row)
+        self.assertEqual("one", workbook["Responses"]["A2"].value)
         workbook.close()
 
     def test_legacy_excel_writer_still_matches_output_contract(self):
