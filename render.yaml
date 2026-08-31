@@ -2,7 +2,7 @@ services:
   - type: web
     name: amex-air
     runtime: docker
-    plan: starter
+    plan: free
     healthCheckPath: /health
     autoDeployTrigger: commit
     envVars:
