@@ -55,6 +55,6 @@ node --check static\air.js
 
 ## Operational notes
 
-Google can vary AI Overviews by query, region, account state, timing, and automated-access controls. AMEX AIR does not bypass CAPTCHAs; failures remain clearly recorded in the output.
+Google can vary AI Overviews by query, region, account state, timing, and automated-access controls. AMEX AIR does not bypass CAPTCHAs. The laptop worker spaces searches by a random 10-15 seconds, rests for 90 seconds after every 20 queries, and pauses for five minutes before retrying when Google displays an unusual-traffic or CAPTCHA block. These values can be adjusted with the `AIR_QUERY_DELAY_MIN_SECONDS`, `AIR_QUERY_DELAY_MAX_SECONDS`, `AIR_BATCH_REST_EVERY`, `AIR_BATCH_REST_SECONDS`, `AIR_CAPTCHA_RETRIES`, and `AIR_CAPTCHA_COOLDOWN_SECONDS` environment variables.
 
 Render free Postgres databases expire after 30 days. Upgrade or migrate the database before its expiry to keep queued jobs, history, and completed workbooks permanently.

@@ -191,6 +191,47 @@ class AirTests(unittest.TestCase):
         self.assertEqual("one", workbook["Responses"]["A2"].value)
         workbook.close()
 
+    def test_laptop_worker_cools_down_and_retries_same_query_after_captcha(self):
+        from unittest.mock import MagicMock, patch
+
+        collected = []
+
+        class FakeCollector:
+            def collect(self, query):
+                collected.append(query)
+                if len(collected) == 1:
+                    return {
+                        "status": "Failed",
+                        "response": "Google displayed a CAPTCHA or unusual-traffic block.",
+                        "parsed_json": "",
+                        "execution_time": 0.1,
+                    }
+                return {"status": "Success", "response": f"answer: {query}", "parsed_json": "{}", "execution_time": 0.1}
+
+        worker = RemoteWorker("https://example.test", "secret", worker_id="laptop")
+        updates = []
+        uploads = []
+        worker.update = lambda _run_id, completed, query, message: updates.append((completed, query, message)) or False
+
+        def capture(path, **kwargs):
+            uploads.append((path, kwargs["data"], kwargs["files"]["workbook"][1].read()))
+            return MagicMock()
+
+        worker.post = capture
+        settings = {
+            "AIR_QUERY_DELAY_SECONDS": "0",
+            "AIR_CAPTCHA_COOLDOWN_SECONDS": "0",
+            "AIR_CAPTCHA_RETRIES": "1",
+            "AIR_BATCH_REST_EVERY": "0",
+        }
+        with patch("air.remote_worker.GoogleAIOverviewCollector", FakeCollector), patch.dict("os.environ", settings):
+            worker.process({"run_id": "r" * 32, "filename": "queries.txt", "queries": ["one"]})
+
+        self.assertEqual(["one", "one"], collected)
+        self.assertTrue(any("temporarily blocked" in message for _, _, message in updates))
+        self.assertEqual("1", str(uploads[0][1]["success_count"]))
+        self.assertEqual("0", str(uploads[0][1]["failed_count"]))
+
     def test_legacy_excel_writer_still_matches_output_contract(self):
         job_root = Path(self.temp.name) / "legacy-job"
         job_root.mkdir()

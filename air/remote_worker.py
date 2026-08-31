@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import socket
 import tempfile
 import time
@@ -61,12 +62,37 @@ class RemoteWorker:
                     files={"workbook": ("amex_air_results.xlsx", workbook, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
                 )
 
+    @staticmethod
+    def is_google_block(result):
+        detail = str(result.get("response", "")).lower()
+        return result.get("status") == "Failed" and (
+            "captcha" in detail or "unusual-traffic" in detail or "unusual traffic" in detail
+        )
+
+    def wait_with_cancel(self, run_id, completed, query, seconds, message):
+        deadline = time.monotonic() + max(0, seconds)
+        if self.update(run_id, completed, query, message):
+            return True
+        while time.monotonic() < deadline:
+            time.sleep(min(30, max(0, deadline - time.monotonic())))
+            if time.monotonic() < deadline and self.update(run_id, completed, query, message):
+                return True
+        return False
+
     def process(self, job):
         run_id = job["run_id"]
         queries = job["queries"]
         collector = GoogleAIOverviewCollector()
         rows = []
-        delay = max(0, float(os.getenv("AIR_QUERY_DELAY_SECONDS", "2")))
+        legacy_setting = os.getenv("AIR_QUERY_DELAY_SECONDS")
+        legacy_delay = float(legacy_setting) if legacy_setting is not None else 10
+        delay_min = max(0, float(os.getenv("AIR_QUERY_DELAY_MIN_SECONDS", str(legacy_delay))))
+        default_delay_max = legacy_delay if legacy_setting is not None else 15
+        delay_max = max(delay_min, float(os.getenv("AIR_QUERY_DELAY_MAX_SECONDS", str(default_delay_max))))
+        rest_every = max(0, int(os.getenv("AIR_BATCH_REST_EVERY", "20")))
+        rest_seconds = max(0, float(os.getenv("AIR_BATCH_REST_SECONDS", "90")))
+        captcha_retries = max(0, int(os.getenv("AIR_CAPTCHA_RETRIES", "2")))
+        captcha_cooldown = max(0, float(os.getenv("AIR_CAPTCHA_COOLDOWN_SECONDS", "300")))
         try:
             for index, query in enumerate(queries, start=1):
                 cancelled = self.update(run_id, index - 1, query, f"Collecting query {index} of {len(queries)} on the laptop...")
@@ -75,14 +101,48 @@ class RemoteWorker:
                     print(f"[{run_id}] Cancelled before query {index}; uploaded {len(rows)} partial results.", flush=True)
                     return
                 result = collector.collect(query)
+                retry = 0
+                while self.is_google_block(result) and retry < captcha_retries:
+                    retry += 1
+                    message = (
+                        f"Google temporarily blocked automated searches. Pausing for "
+                        f"{int(captcha_cooldown)} seconds before retry {retry} of {captcha_retries}; "
+                        "no additional searches are being sent."
+                    )
+                    if self.wait_with_cancel(run_id, index - 1, query, captcha_cooldown, message):
+                        self.upload_results(run_id, rows)
+                        print(f"[{run_id}] Cancelled during Google cooldown; uploaded {len(rows)} partial results.", flush=True)
+                        return
+                    result = collector.collect(query)
                 rows.append({"prompt": query, **result})
                 cancelled = self.update(run_id, index, query, f"Completed query {index} of {len(queries)}.")
                 if cancelled:
                     self.upload_results(run_id, rows)
                     print(f"[{run_id}] Cancelled after query {index}; uploaded {len(rows)} partial results.", flush=True)
                     return
-                if delay and index < len(queries):
-                    time.sleep(delay)
+                if index < len(queries):
+                    if rest_every and index % rest_every == 0:
+                        if self.wait_with_cancel(
+                            run_id,
+                            index,
+                            query,
+                            rest_seconds,
+                            f"Resting for {int(rest_seconds)} seconds after {index} queries to reduce Google traffic.",
+                        ):
+                            self.upload_results(run_id, rows)
+                            print(f"[{run_id}] Cancelled during batch rest; uploaded {len(rows)} partial results.", flush=True)
+                            return
+                    delay = random.uniform(delay_min, delay_max)
+                    if delay and self.wait_with_cancel(
+                        run_id,
+                        index,
+                        query,
+                        delay,
+                        f"Waiting {int(round(delay))} seconds before the next query to reduce Google traffic.",
+                    ):
+                        self.upload_results(run_id, rows)
+                        print(f"[{run_id}] Cancelled between queries; uploaded {len(rows)} partial results.", flush=True)
+                        return
             self.upload_results(run_id, rows)
 
             print(f"[{run_id}] Completed {len(queries)} queries.", flush=True)
