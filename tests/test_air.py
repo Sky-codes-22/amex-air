@@ -43,10 +43,10 @@ class AirTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertIn(b"AMEX AIR", response.data)
         self.assertIn(b"AI Insights &amp; Responses", response.data)
-        self.assertIn(b"100 unique queries", response.data)
+        self.assertIn(b"500 unique queries", response.data)
         self.assertIn(b"Request status", response.data)
 
-    def test_supported_inputs_and_100_query_limit(self):
+    def test_supported_inputs_and_500_query_limit(self):
         self.assertEqual(["one", "two"], read_queries("q.txt", b"one\ntwo\none\n"))
         self.assertEqual(["one", "two"], read_queries("q.csv", b"Prompt,Other\none,x\ntwo,y\n"))
         book = Workbook()
@@ -57,8 +57,8 @@ class AirTests(unittest.TestCase):
         stream = io.BytesIO()
         book.save(stream)
         self.assertEqual(["one", "two"], read_queries("q.xlsx", stream.getvalue()))
-        with self.assertRaisesRegex(InputError, "at most 100"):
-            read_queries("q.txt", "\n".join(f"query {i}" for i in range(101)).encode())
+        with self.assertRaisesRegex(InputError, "at most 500"):
+            read_queries("q.txt", "\n".join(f"query {i}" for i in range(501)).encode())
 
     def test_upload_is_durable_and_visible_to_same_browser(self):
         response = self.upload()

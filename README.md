@@ -4,7 +4,7 @@ AMEX AIR (AI Insights & Responses) is an independent web application for queuein
 
 ## User flow
 
-1. A user uploads `.xlsx`, `.csv`, or `.txt` with up to 100 unique queries.
+1. A user uploads `.xlsx`, `.csv`, or `.txt` with up to 500 unique queries.
 2. The hosted application stores the request in a durable database and shows it under **Request status**.
 3. The laptop processing engine claims queued requests whenever it is online.
 4. Progress is sent back to the website after every query.
@@ -42,7 +42,7 @@ The web container does not install or run Chromium. `render.yaml` declares the w
 
 - `.xlsx` or `.csv`: a `Prompt` column is preferred; otherwise the first column is used.
 - `.txt`: one query per line.
-- Maximum 100 unique queries and 25 MB per upload.
+- Maximum 500 unique queries and 25 MB per upload.
 - Output keeps the existing `Responses` worksheet and columns.
 
 ## Tests
