@@ -1,1 +1,202 @@
-(()=>{const q=s=>document.querySelector(s),file=q("#file-input"),drop=q("#drop-zone"),selected=q("#selected-file"),run=q("#run"),error=q("#error"),upload=q("#upload-view"),processing=q("#processing-view"),complete=q("#complete-view"),title=q("#progress-title"),current=q("#current-query"),count=q("#progress-count"),bar=q("#progress-bar"),stop=q("#stop"),summary=q("#summary"),download=q("#download"),reset=q("#reset");let chosen=null,job=null,timer=null,restarted=false;const showError=m=>{error.textContent=m;error.hidden=!m};function choose(f){showError("");restarted=false;if(!f){chosen=null;selected.textContent="No file selected";run.disabled=true;return}if(!/\.(xlsx|csv|txt)$/i.test(f.name)){choose(null);showError("Choose an .xlsx, .csv, or .txt file.");return}chosen=f;selected.textContent=f.name;run.disabled=false}file.onchange=()=>choose(file.files[0]);["dragenter","dragover"].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.add("drag")}));["dragleave","drop"].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.remove("drag")}));drop.addEventListener("drop",e=>choose(e.dataTransfer.files[0]));async function payload(r){const t=await r.text();try{return JSON.parse(t)}catch{return{error:t||`HTTP ${r.status}`}}}function inputState(message=""){clearTimeout(timer);job=null;processing.hidden=true;complete.hidden=true;upload.hidden=false;run.disabled=!chosen;showError(message)}async function poll(){if(!job)return;try{const r=await fetch(job.status,{cache:"no-store"}),p=await payload(r);if(!r.ok){if(r.status===404&&p.code==="job_state_lost"&&!restarted){restarted=true;job=null;title.textContent="The hosted service restarted. Resuming automatically...";current.textContent="Re-uploading your query file once.";timer=setTimeout(()=>run.click(),1200);return}throw Error(p.error||`Status request failed with HTTP ${r.status}.`)}if(p.state==="completed"){job=null;processing.hidden=true;complete.hidden=false;summary.textContent=`${p.total} queries processed: ${p.success_count} successful and ${p.failed_count} failed.`;download.href=p.download_url;return}if(p.state==="failed"){inputState(p.error||"Collection failed without an error detail.");return}if(p.state==="cancelled"){inputState(p.message||"Collection stopped.");return}title.textContent=p.message||"Collecting Google AI Overviews...";current.textContent=p.current_query||"Preparing your query batch.";count.textContent=`${p.completed||0} of ${p.total||0} completed`;bar.style.width=`${p.total?Math.round((p.completed||0)/p.total*100):0}%`;timer=setTimeout(poll,1200)}catch(e){inputState(`AMEX AIR could not retrieve progress. Reason: ${e.message}`)}}run.onclick=async()=>{if(!chosen)return;upload.hidden=true;processing.hidden=false;complete.hidden=true;title.textContent="Preparing hosted browser...";current.textContent="Uploading and validating your query file.";bar.style.width="0";const form=new FormData();form.append("file",chosen);try{const r=await fetch("/jobs",{method:"POST",body:form}),p=await payload(r);if(!r.ok)throw Error(p.error||`Server returned HTTP ${r.status}.`);job={status:p.status_url,cancel:p.cancel_url};poll()}catch(e){inputState(`AMEX AIR could not start. Reason: ${e.message}`)}};stop.onclick=async()=>{if(!job)return;stop.disabled=true;try{const r=await fetch(job.cancel,{method:"POST"}),p=await payload(r);inputState(p.message||p.error||"Collection stopped.")}catch(e){inputState(`AMEX AIR could not stop the job. Reason: ${e.message}`)}finally{stop.disabled=false}};reset.onclick=()=>{chosen=null;file.value="";selected.textContent="No file selected";inputState("")}})();
+(() => {
+  const q = (selector) => document.querySelector(selector);
+  const fileInput = q("#file-input");
+  const drop = q("#drop-zone");
+  const selected = q("#selected-file");
+  const run = q("#run");
+  const error = q("#error");
+  const notice = q("#notice");
+  const jobsRoot = q("#jobs");
+  const empty = q("#empty");
+  const worker = q("#worker");
+  let chosen = null;
+  let refreshTimer = null;
+
+  function makeId() {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    return [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+  }
+
+  const clientId = localStorage.getItem("amex_air_client_id") || makeId();
+  localStorage.setItem("amex_air_client_id", clientId);
+
+  function message(element, text) {
+    element.textContent = text || "";
+    element.hidden = !text;
+  }
+
+  function choose(file) {
+    message(error, "");
+    message(notice, "");
+    if (!file) {
+      chosen = null;
+      selected.textContent = "No file selected";
+      run.disabled = true;
+      return;
+    }
+    if (!/\.(xlsx|csv|txt)$/i.test(file.name)) {
+      choose(null);
+      message(error, "Choose an .xlsx, .csv, or .txt file.");
+      return;
+    }
+    chosen = file;
+    selected.textContent = file.name;
+    run.disabled = false;
+  }
+
+  async function payload(response) {
+    const text = await response.text();
+    try { return JSON.parse(text); }
+    catch { return { error: text || `HTTP ${response.status}` }; }
+  }
+
+  async function api(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    headers.set("X-AIR-Client-ID", clientId);
+    const response = await fetch(path, { ...options, headers, cache: "no-store" });
+    const data = await payload(response);
+    if (!response.ok) throw new Error(data.error || `Server returned HTTP ${response.status}.`);
+    return data;
+  }
+
+  function formatTime(value) {
+    try { return new Date(value).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }); }
+    catch { return value; }
+  }
+
+  function jobCard(job) {
+    const card = document.createElement("article");
+    card.className = "job";
+    const top = document.createElement("div");
+    top.className = "job-top";
+    const identity = document.createElement("div");
+    const name = document.createElement("h3");
+    name.className = "job-name";
+    name.textContent = job.filename;
+    const time = document.createElement("p");
+    time.className = "job-time";
+    time.textContent = `${job.total} ${job.total === 1 ? "query" : "queries"} · ${formatTime(job.created_at)}`;
+    identity.append(name, time);
+    const state = document.createElement("span");
+    state.className = `state ${job.state}`;
+    state.textContent = job.state === "processing" ? "Processing" : job.state;
+    top.append(identity, state);
+
+    const detail = document.createElement("p");
+    detail.className = "job-message";
+    detail.textContent = job.error || job.message;
+    card.append(top, detail);
+    if (job.current_query) {
+      const current = document.createElement("p");
+      current.className = "job-query";
+      current.textContent = `Current: ${job.current_query}`;
+      card.append(current);
+    }
+
+    const progress = document.createElement("div");
+    progress.className = "progress-track";
+    const fill = document.createElement("div");
+    fill.style.width = `${job.total ? Math.round(job.completed / job.total * 100) : 0}%`;
+    progress.append(fill);
+    card.append(progress);
+
+    const bottom = document.createElement("div");
+    bottom.className = "job-bottom";
+    const counts = document.createElement("span");
+    counts.className = "counts";
+    counts.textContent = job.state === "completed"
+      ? `${job.success_count} successful · ${job.failed_count} failed`
+      : `${job.completed} of ${job.total} completed`;
+    bottom.append(counts);
+
+    if (job.state === "completed" && job.download_token) {
+      const download = document.createElement("a");
+      download.className = "action";
+      download.textContent = "Download Excel";
+      download.href = `/jobs/${job.run_id}/download?token=${encodeURIComponent(job.download_token)}`;
+      bottom.append(download);
+    } else if (["queued", "processing"].includes(job.state)) {
+      const cancel = document.createElement("button");
+      cancel.className = "action cancel";
+      cancel.textContent = job.cancel_requested ? "Stopping…" : "Cancel request";
+      cancel.disabled = job.cancel_requested;
+      cancel.dataset.cancel = job.run_id;
+      bottom.append(cancel);
+    }
+    card.append(bottom);
+    return card;
+  }
+
+  function render(data) {
+    worker.className = `worker ${data.worker.online ? "online" : "offline"}`;
+    worker.querySelector("strong").textContent = data.worker.online ? "Processing engine online" : "Processing engine offline";
+    jobsRoot.replaceChildren(...data.jobs.map(jobCard));
+    empty.hidden = data.jobs.length > 0;
+  }
+
+  async function loadJobs() {
+    clearTimeout(refreshTimer);
+    try {
+      render(await api("/jobs"));
+    } catch (caught) {
+      message(error, `AMEX AIR could not refresh request status. Reason: ${caught.message}`);
+    } finally {
+      refreshTimer = setTimeout(loadJobs, 5000);
+    }
+  }
+
+  fileInput.onchange = () => choose(fileInput.files[0]);
+  ["dragenter", "dragover"].forEach((name) => drop.addEventListener(name, (event) => {
+    event.preventDefault();
+    drop.classList.add("drag");
+  }));
+  ["dragleave", "drop"].forEach((name) => drop.addEventListener(name, (event) => {
+    event.preventDefault();
+    drop.classList.remove("drag");
+  }));
+  drop.addEventListener("drop", (event) => choose(event.dataTransfer.files[0]));
+
+  run.onclick = async () => {
+    if (!chosen) return;
+    run.disabled = true;
+    run.textContent = "Queueing request…";
+    message(error, "");
+    message(notice, "");
+    const form = new FormData();
+    form.append("file", chosen);
+    try {
+      const data = await api("/jobs", { method: "POST", body: form });
+      message(notice, data.job.state === "queued"
+        ? "Request queued. It will start automatically when the laptop processing engine is online."
+        : "Request accepted.");
+      fileInput.value = "";
+      choose(null);
+      await loadJobs();
+    } catch (caught) {
+      message(error, `AMEX AIR could not queue the request. Reason: ${caught.message}`);
+      run.disabled = !chosen;
+    } finally {
+      run.textContent = "Queue AMEX AIR request";
+    }
+  };
+
+  jobsRoot.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-cancel]");
+    if (!button) return;
+    button.disabled = true;
+    button.textContent = "Stopping…";
+    try {
+      await api(`/jobs/${button.dataset.cancel}/cancel`, { method: "POST" });
+      await loadJobs();
+    } catch (caught) {
+      message(error, `AMEX AIR could not cancel the request. Reason: ${caught.message}`);
+      button.disabled = false;
+      button.textContent = "Cancel request";
+    }
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) loadJobs();
+  });
+  loadJobs();
+})();

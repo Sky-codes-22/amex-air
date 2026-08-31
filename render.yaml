@@ -1,3 +1,8 @@
+databases:
+  - name: amex-air-db
+    plan: free
+    databaseName: amex_air
+    user: amex_air
 services:
   - type: web
     name: amex-air
@@ -6,7 +11,9 @@ services:
     healthCheckPath: /health
     autoDeployTrigger: commit
     envVars:
-      - key: AIR_HEADLESS
-        value: "true"
-      - key: AIR_QUERY_DELAY_SECONDS
-        value: "2"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: amex-air-db
+          property: connectionString
+      - key: AIR_WORKER_TOKEN
+        generateValue: true
