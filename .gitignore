@@ -4,3 +4,4 @@ output/
 .env
 .venv/
 .pytest_cache/
+.tools/
