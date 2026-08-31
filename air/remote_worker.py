@@ -90,8 +90,21 @@ class RemoteWorker:
 
     def run_forever(self):
         print(f"AMEX AIR laptop worker '{self.worker_id}' connecting to {self.server_url}", flush=True)
+        cdp_url = os.getenv("AIR_CDP_URL", "").rstrip("/")
+        chrome_warning_shown = False
         while True:
             try:
+                if cdp_url:
+                    try:
+                        response = requests.get(f"{cdp_url}/json/version", timeout=3)
+                        response.raise_for_status()
+                        chrome_warning_shown = False
+                    except requests.RequestException:
+                        if not chrome_warning_shown:
+                            print(f"Chrome is not available at {cdp_url}. Requests will remain queued until it starts.", flush=True)
+                            chrome_warning_shown = True
+                        time.sleep(self.poll_seconds)
+                        continue
                 self.heartbeat()
                 job = self.claim()
                 if job:

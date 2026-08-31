@@ -27,7 +27,7 @@ Copy `.env.example` to `.env`, configure the same `AIR_WORKER_TOKEN` used by the
 .\start_laptop_worker.ps1
 ```
 
-The checked-in launcher reads `.env` and runs `python -m air.remote_worker`. The laptop only makes outbound HTTPS requests; no router port or inbound connection is required. When the laptop is off, requests remain queued.
+The checked-in launcher reads `.env` and runs `python -m air.remote_worker`. The laptop only makes outbound HTTPS requests; no router port or inbound connection is required. When the laptop is off, requests remain queued. When `AIR_CDP_URL=http://127.0.0.1:9222` is configured, the worker uses the existing YesJohnny-compatible Chrome session. If that Chrome session is unavailable, the worker stays offline and leaves requests safely queued.
 
 ## Hosted application
 
