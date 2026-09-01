@@ -352,6 +352,26 @@ class AirTests(unittest.TestCase):
         )
         workbook.close()
 
+    def test_excel_keeps_blue_link_headline_url_and_sponsored_status(self):
+        from air.excel_output import results_bytes
+
+        links = [{
+            "headline": "Example result",
+            "url": "https://example.com/result",
+            "sponsored": False,
+        }]
+        workbook = load_workbook(
+            io.BytesIO(results_bytes([{
+                "prompt": "query", "status": "Success", "response": "answer",
+                "parsed_json": "{}", "top_blue_links": json.dumps(links),
+                "execution_time": 0.1,
+            }])),
+            read_only=True,
+            data_only=True,
+        )
+        self.assertEqual(links, json.loads(workbook["Responses"]["E2"].value))
+        workbook.close()
+
 
 if __name__ == "__main__":
     unittest.main()

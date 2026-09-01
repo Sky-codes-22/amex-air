@@ -66,17 +66,19 @@ class GoogleAIOverviewCollector:
                             if (labels.some(x => /^(Sponsored|Ad)$/i.test((x.innerText || '').trim())) ||
                                 /\b(Sponsored|Ad)\b/i.test(aria)) { sponsored = true; break; }
                           }
-                          return {headline, sponsored};
+                          return {headline, url: a.href, sponsored};
                         })
                         """)
                         seen = set()
                         for candidate in candidates:
                             headline = str(candidate.get("headline", "")).strip()
-                            if not headline or headline.casefold() in seen:
+                            url = str(candidate.get("url", "")).strip()
+                            if not headline or not url or headline.casefold() in seen:
                                 continue
                             seen.add(headline.casefold())
                             blue_links.append({
                                 "headline": headline,
+                                "url": url,
                                 "sponsored": bool(candidate.get("sponsored", False)),
                             })
                             if len(blue_links) == 3:
