@@ -11,6 +11,7 @@
   const worker = q("#worker");
   let chosen = null;
   let refreshTimer = null;
+  let countdownTimer = null;
 
   function makeId() {
     const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -92,6 +93,12 @@
       current.textContent = `Current: ${job.current_query}`;
       card.append(current);
     }
+    if (job.cooldown_until) {
+      const cooldown = document.createElement("span");
+      cooldown.className = "cooldown";
+      cooldown.dataset.cooldownUntil = job.cooldown_until;
+      card.append(cooldown);
+    }
 
     const progress = document.createElement("div");
     progress.className = "progress-track";
@@ -104,19 +111,29 @@
     bottom.className = "job-bottom";
     const counts = document.createElement("span");
     counts.className = "counts";
-    counts.textContent = job.state === "completed"
+    counts.textContent = ["completed", "cancelled", "paused", "timed_out", "failed"].includes(job.state) && job.download_url
       ? `${job.success_count} successful · ${job.failed_count} failed`
-      : job.state === "cancelled" && job.download_token
-        ? `${job.completed} processed · ${job.success_count} successful · ${job.failed_count} failed`
-        : `${job.completed} of ${job.total} completed`;
+      : `${job.completed} of ${job.total} completed`;
     bottom.append(counts);
 
-    if (job.download_token) {
+    const downloads = document.createElement("div");
+    downloads.className = "downloads";
+    for (const batch of job.batch_downloads || []) {
+      const link = document.createElement("a");
+      link.className = "action secondary";
+      link.textContent = `Batch ${batch.batch_number}`;
+      link.href = batch.download_url;
+      downloads.append(link);
+    }
+    if (job.download_url) {
       const download = document.createElement("a");
       download.className = "action";
-      download.textContent = job.state === "cancelled" ? "Download partial Excel" : "Download Excel";
-      download.href = `/jobs/${job.run_id}/download?token=${encodeURIComponent(job.download_token)}`;
-      bottom.append(download);
+      download.textContent = job.state === "completed" ? "Download combined Excel" : "Download combined partial Excel";
+      download.href = job.download_url;
+      downloads.append(download);
+    }
+    if (downloads.children.length) {
+      bottom.append(downloads);
     } else if (["queued", "processing"].includes(job.state)) {
       const cancel = document.createElement("button");
       cancel.className = "action cancel";
@@ -134,6 +151,16 @@
     worker.querySelector("strong").textContent = data.worker.online ? "Processing engine online" : "Processing engine offline";
     jobsRoot.replaceChildren(...data.jobs.map(jobCard));
     empty.hidden = data.jobs.length > 0;
+    updateCountdowns();
+  }
+
+  function updateCountdowns() {
+    document.querySelectorAll("[data-cooldown-until]").forEach((element) => {
+      const remaining = Math.max(0, Math.ceil((new Date(element.dataset.cooldownUntil) - Date.now()) / 1000));
+      const minutes = Math.floor(remaining / 60).toString().padStart(2, "0");
+      const seconds = (remaining % 60).toString().padStart(2, "0");
+      element.textContent = remaining ? `Cooldown ${minutes}:${seconds}` : "Cooldown ending⬦";
+    });
   }
 
   async function loadJobs() {
@@ -200,5 +227,6 @@
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) loadJobs();
   });
+  countdownTimer = setInterval(updateCountdowns, 1000);
   loadJobs();
 })();

@@ -7,12 +7,15 @@ import socket
 import tempfile
 import time
 import traceback
+from io import BytesIO
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
 from air.collector import GoogleAIOverviewCollector
 from air.excel_output import write_results
+from air.inputs import BATCH_SIZE
 
 
 class RemoteWorker:
@@ -35,7 +38,7 @@ class RemoteWorker:
         response = self.post("/worker/claim", json={"worker_id": self.worker_id})
         return None if response.status_code == 204 else response.json()["job"]
 
-    def update(self, run_id, completed, current_query, message):
+    def update(self, run_id, completed, current_query, message, cooldown_until=None):
         response = self.post(
             f"/worker/jobs/{run_id}/progress",
             json={
@@ -43,24 +46,42 @@ class RemoteWorker:
                 "completed": completed,
                 "current_query": current_query,
                 "message": message,
+                "cooldown_until": cooldown_until,
             },
         )
         return response.json().get("cancel_requested", False)
 
-    def upload_results(self, run_id, rows):
+    def upload_results(self, run_id, rows, terminal_state="completed", terminal_message=None):
         with tempfile.TemporaryDirectory(prefix="amex_air_") as directory:
-            output = Path(directory) / "amex_air_results.xlsx"
+            directory = Path(directory)
+            output = directory / "amex_air_all_batches.xlsx"
             write_results(output, rows)
-            with output.open("rb") as workbook:
-                self.post(
-                    f"/worker/jobs/{run_id}/complete",
-                    data={
-                        "worker_id": self.worker_id,
-                        "success_count": sum(row["status"] == "Success" for row in rows),
-                        "failed_count": sum(row["status"] == "Failed" for row in rows),
-                    },
-                    files={"workbook": ("amex_air_results.xlsx", workbook, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                )
+            batch_paths = []
+            for offset in range(0, len(rows), BATCH_SIZE):
+                number = offset // BATCH_SIZE + 1
+                batch_path = directory / f"amex_air_batch_{number}.xlsx"
+                write_results(batch_path, rows[offset:offset + BATCH_SIZE])
+                batch_paths.append(batch_path)
+            combined_bytes = output.read_bytes()
+            files = [(
+                "workbook",
+                ("amex_air_all_batches.xlsx", BytesIO(combined_bytes), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            )]
+            files.extend((
+                "batches",
+                (path.name, BytesIO(path.read_bytes()), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            ) for path in batch_paths)
+            self.post(
+                f"/worker/jobs/{run_id}/complete",
+                data={
+                    "worker_id": self.worker_id,
+                    "success_count": sum(row["status"] == "Success" for row in rows),
+                    "failed_count": sum(row["status"] == "Failed" for row in rows),
+                    "terminal_state": terminal_state,
+                    "terminal_message": terminal_message or "",
+                },
+                files=files,
+            )
 
     @staticmethod
     def is_google_block(result):
@@ -71,11 +92,16 @@ class RemoteWorker:
 
     def wait_with_cancel(self, run_id, completed, query, seconds, message):
         deadline = time.monotonic() + max(0, seconds)
-        if self.update(run_id, completed, query, message):
+        cooldown_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=max(0, seconds))
+        ).isoformat()
+        if self.update(run_id, completed, query, message, cooldown_until=cooldown_until):
             return True
         while time.monotonic() < deadline:
             time.sleep(min(30, max(0, deadline - time.monotonic())))
-            if time.monotonic() < deadline and self.update(run_id, completed, query, message):
+            if time.monotonic() < deadline and self.update(
+                run_id, completed, query, message, cooldown_until=cooldown_until
+            ):
                 return True
         return False
 
@@ -92,7 +118,10 @@ class RemoteWorker:
         rest_every = max(0, int(os.getenv("AIR_BATCH_REST_EVERY", "20")))
         rest_seconds = max(0, float(os.getenv("AIR_BATCH_REST_SECONDS", "90")))
         captcha_retries = max(0, int(os.getenv("AIR_CAPTCHA_RETRIES", "2")))
-        captcha_cooldown = max(0, float(os.getenv("AIR_CAPTCHA_COOLDOWN_SECONDS", "300")))
+        captcha_cooldown = max(0, float(os.getenv("AIR_CAPTCHA_COOLDOWN_SECONDS", "1800")))
+        inter_batch_cooldown = max(
+            0, float(os.getenv("AIR_INTER_BATCH_COOLDOWN_SECONDS", "1800"))
+        )
         try:
             for index, query in enumerate(queries, start=1):
                 cancelled = self.update(run_id, index - 1, query, f"Collecting query {index} of {len(queries)} on the laptop...")
@@ -114,6 +143,23 @@ class RemoteWorker:
                         print(f"[{run_id}] Cancelled during Google cooldown; uploaded {len(rows)} partial results.", flush=True)
                         return
                     result = collector.collect(query)
+                if self.is_google_block(result):
+                    rows.append({"prompt": query, **result})
+                    self.update(
+                        run_id, index, query,
+                        "Google CAPTCHA remained after 2 retries. Processing paused; partial files are ready."
+                    )
+                    self.upload_results(
+                        run_id,
+                        rows,
+                        terminal_state="paused",
+                        terminal_message=(
+                            "Google CAPTCHA remained after 2 retries. Processing ended "
+                            "and all results collected so far are ready to download."
+                        ),
+                    )
+                    print(f"[{run_id}] CAPTCHA persisted after {captcha_retries} retries; uploaded partial results.", flush=True)
+                    return
                 rows.append({"prompt": query, **result})
                 cancelled = self.update(run_id, index, query, f"Completed query {index} of {len(queries)}.")
                 if cancelled:
@@ -121,6 +167,16 @@ class RemoteWorker:
                     print(f"[{run_id}] Cancelled after query {index}; uploaded {len(rows)} partial results.", flush=True)
                     return
                 if index < len(queries):
+                    if index % BATCH_SIZE == 0 and self.wait_with_cancel(
+                        run_id,
+                        index,
+                        query,
+                        inter_batch_cooldown,
+                        f"Batch {index // BATCH_SIZE} complete. Cooling down for 30 minutes before the next batch.",
+                    ):
+                        self.upload_results(run_id, rows)
+                        print(f"[{run_id}] Cancelled between batches; uploaded {len(rows)} partial results.", flush=True)
+                        return
                     if rest_every and index % rest_every == 0:
                         if self.wait_with_cancel(
                             run_id,
@@ -150,9 +206,19 @@ class RemoteWorker:
             detail = f"{type(error).__name__}: {error}"
             print(f"[{run_id}] Failed: {detail}\n{traceback.format_exc()}", flush=True)
             try:
-                self.post(f"/worker/jobs/{run_id}/fail", json={"worker_id": self.worker_id, "error": detail})
-            except Exception as report_error:
-                print(f"[{run_id}] Could not report failure: {report_error}", flush=True)
+                terminal_state = "timed_out" if isinstance(error, TimeoutError) else "failed"
+                self.upload_results(
+                    run_id,
+                    rows,
+                    terminal_state=terminal_state,
+                    terminal_message=f"Processing ended early ({detail}). Partial results are ready to download.",
+                )
+            except Exception as upload_error:
+                print(f"[{run_id}] Could not upload partial results: {upload_error}", flush=True)
+                try:
+                    self.post(f"/worker/jobs/{run_id}/fail", json={"worker_id": self.worker_id, "error": detail})
+                except Exception as report_error:
+                    print(f"[{run_id}] Could not report failure: {report_error}", flush=True)
 
     def run_forever(self):
         print(f"AMEX AIR laptop worker '{self.worker_id}' connecting to {self.server_url}", flush=True)

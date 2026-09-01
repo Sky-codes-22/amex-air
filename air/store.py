@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Boolean, DateTime, Integer, LargeBinary, String, Text, create_engine, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, LargeBinary, String, Text, create_engine, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 
@@ -30,8 +30,20 @@ class Job(Base):
     workbook: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class JobArtifact(Base):
+    __tablename__ = "job_artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), index=True)
+    token: Mapped[str] = mapped_column(String(64), unique=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    batch_number: Mapped[int] = mapped_column(Integer)
+    workbook: Mapped[bytes] = mapped_column(LargeBinary)
 
 
 class WorkerHeartbeat(Base):
@@ -59,6 +71,10 @@ class JobStore:
             database_url = "postgresql+psycopg://" + database_url[len("postgresql://"):]
         self.engine = create_engine(database_url, pool_pre_ping=True)
         Base.metadata.create_all(self.engine)
+        columns = {column["name"] for column in inspect(self.engine).get_columns("jobs")}
+        if "cooldown_until" not in columns:
+            with self.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE jobs ADD COLUMN cooldown_until TIMESTAMP"))
 
     def create_job(self, *, run_id, client_id, download_token, filename, queries):
         now = utcnow()
@@ -77,21 +93,21 @@ class JobStore:
             )
             session.add(job)
             session.commit()
-            return self._public(job)
+            return self._public(job, [])
 
     def list_jobs(self, client_id):
         with Session(self.engine) as session:
             jobs = session.scalars(select(Job).where(Job.client_id == client_id).order_by(Job.created_at.desc())).all()
-            return [self._public(job) for job in jobs]
+            return [self._public(job, self._artifacts(session, job.id)) for job in jobs]
 
     def get_job(self, run_id, client_id=None):
         with Session(self.engine) as session:
             job = session.get(Job, run_id)
             if not job or (client_id is not None and job.client_id != client_id):
                 return None
-            return self._public(job)
+            return self._public(job, self._artifacts(session, job.id))
 
-    def cancel(self, run_id, client_id):
+    def cancel(self, run_id, client_id, empty_workbook=None):
         with Session(self.engine) as session:
             job = session.get(Job, run_id)
             if not job or job.client_id != client_id:
@@ -99,12 +115,14 @@ class JobStore:
             if job.state == "queued":
                 job.state = "cancelled"
                 job.message = "Collection cancelled before processing started."
+                if empty_workbook is not None:
+                    job.workbook = empty_workbook
             elif job.state == "processing":
                 job.cancel_requested = True
                 job.message = "Cancellation requested. The laptop worker will stop after the current query."
             job.updated_at = utcnow()
             session.commit()
-            return self._public(job)
+            return self._public(job, self._artifacts(session, job.id))
 
     def heartbeat(self, worker_id):
         now = utcnow()
@@ -144,7 +162,7 @@ class JobStore:
             session.commit()
             return {"run_id": job.id, "filename": job.filename, "queries": json.loads(job.queries_json)}
 
-    def progress(self, run_id, worker_id, *, completed, current_query, message):
+    def progress(self, run_id, worker_id, *, completed, current_query, message, cooldown_until=None):
         self.heartbeat(worker_id)
         with Session(self.engine) as session:
             job = session.get(Job, run_id)
@@ -153,27 +171,52 @@ class JobStore:
             job.completed = max(0, min(int(completed), job.total))
             job.current_query = str(current_query or "")[:2000] or None
             job.message = str(message or "Processing...")[:1000]
+            if cooldown_until:
+                try:
+                    job.cooldown_until = datetime.fromisoformat(str(cooldown_until).replace("Z", "+00:00"))
+                except ValueError:
+                    job.cooldown_until = None
+            else:
+                job.cooldown_until = None
             job.updated_at = utcnow()
             cancelled = job.cancel_requested
             session.commit()
             return {"cancel_requested": cancelled}
 
-    def complete(self, run_id, worker_id, *, workbook, success_count, failed_count):
+    def complete(
+        self, run_id, worker_id, *, workbook, success_count, failed_count,
+        artifacts=None, terminal_state="completed", terminal_message=None
+    ):
         with Session(self.engine) as session:
             job = session.get(Job, run_id)
             if not job or job.worker_id != worker_id or job.state != "processing":
                 return False
             job.success_count = int(success_count)
             job.failed_count = int(failed_count)
+            job.completed = min(job.total, job.success_count + job.failed_count)
             job.workbook = workbook
+            session.query(JobArtifact).filter(JobArtifact.job_id == job.id).delete()
+            for artifact in artifacts or []:
+                session.add(JobArtifact(
+                    job_id=job.id,
+                    token=artifact["token"],
+                    filename=artifact["filename"][:255],
+                    batch_number=int(artifact["batch_number"]),
+                    workbook=artifact["workbook"],
+                ))
             if job.cancel_requested:
                 job.state = "cancelled"
                 job.message = "Collection stopped. Partial results are ready to download."
             else:
-                job.state = "completed"
-                job.completed = job.total
-                job.message = "AMEX AIR collection complete."
+                allowed = {"completed", "paused", "timed_out", "failed"}
+                job.state = terminal_state if terminal_state in allowed else "completed"
+                if job.state == "completed":
+                    job.completed = job.total
+                    job.message = "AMEX AIR collection complete."
+                else:
+                    job.message = str(terminal_message or "Processing ended. Partial results are ready to download.")[:1000]
             job.current_query = None
+            job.cooldown_until = None
             job.updated_at = utcnow()
             state = job.state
             session.commit()
@@ -195,11 +238,24 @@ class JobStore:
     def workbook(self, run_id, token):
         with Session(self.engine) as session:
             job = session.get(Job, run_id)
-            if not job or job.download_token != token or job.state not in {"completed", "cancelled"} or not job.workbook:
+            if not job or job.download_token != token or job.state not in {"completed", "cancelled", "paused", "timed_out", "failed"} or not job.workbook:
                 return None
             return job.workbook, job.filename
 
-    def _public(self, job):
+    def artifact(self, token):
+        with Session(self.engine) as session:
+            artifact = session.scalar(select(JobArtifact).where(JobArtifact.token == token))
+            if not artifact:
+                return None
+            return artifact.workbook, artifact.filename
+
+    @staticmethod
+    def _artifacts(session, job_id):
+        return session.scalars(
+            select(JobArtifact).where(JobArtifact.job_id == job_id).order_by(JobArtifact.batch_number)
+        ).all()
+
+    def _public(self, job, artifacts):
         result = {
             "run_id": job.id,
             "filename": job.filename,
@@ -212,9 +268,18 @@ class JobStore:
             "failed_count": job.failed_count,
             "error": job.error,
             "cancel_requested": job.cancel_requested,
+            "cooldown_until": as_utc(job.cooldown_until).isoformat() if job.cooldown_until else None,
             "created_at": as_utc(job.created_at).isoformat(),
             "updated_at": as_utc(job.updated_at).isoformat(),
         }
         if job.workbook:
             result["download_token"] = job.download_token
+        result["batch_downloads"] = [
+            {
+                "token": artifact.token,
+                "filename": artifact.filename,
+                "batch_number": artifact.batch_number,
+            }
+            for artifact in artifacts
+        ]
         return result

@@ -12,6 +12,11 @@ from air.worker import main as run_legacy_worker
 from app import create_app
 
 
+def uploaded_file(files, field):
+    entries = files.items() if isinstance(files, dict) else files
+    return next(value for key, value in entries if key == field)
+
+
 class AirTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -43,10 +48,10 @@ class AirTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertIn(b"AMEX AIR", response.data)
         self.assertIn(b"AI Insights &amp; Responses", response.data)
-        self.assertIn(b"500 unique queries", response.data)
+        self.assertIn(b"35 queries", response.data)
         self.assertIn(b"Request status", response.data)
 
-    def test_supported_inputs_and_500_query_limit(self):
+    def test_supported_inputs_and_upload_limit(self):
         self.assertEqual(["one", "two"], read_queries("q.txt", b"one\ntwo\none\n"))
         self.assertEqual(["one", "two"], read_queries("q.csv", b"Prompt,Other\none,x\ntwo,y\n"))
         book = Workbook()
@@ -110,6 +115,12 @@ class AirTests(unittest.TestCase):
         self.assertEqual(200, response.status_code, response.get_data(as_text=True))
         queued = response.get_json()["job"]
         self.assertEqual("cancelled", queued["state"])
+        self.assertIn("download_url", queued)
+        empty_output = self.client.get(queued["download_url"])
+        self.assertEqual(200, empty_output.status_code)
+        empty_book = load_workbook(io.BytesIO(empty_output.data), read_only=True, data_only=True)
+        self.assertEqual(1, empty_book["Responses"].max_row)
+        empty_book.close()
         processing_id = self.upload(b"processing").get_json()["job"]["run_id"]
         self.client.post("/worker/claim", json={"worker_id": "laptop"}, headers=self.worker_headers)
         self.client.post(
@@ -150,7 +161,9 @@ class AirTests(unittest.TestCase):
         worker.update = lambda run_id, completed, current_query, message: progress.append((completed, current_query)) or False
 
         def capture(path, **kwargs):
-            uploads.append((path, kwargs["data"], kwargs["files"]["workbook"][1].read()))
+            workbook = uploaded_file(kwargs["files"], "workbook")
+            batches = [value for key, value in kwargs["files"] if key == "batches"]
+            uploads.append((path, kwargs["data"], workbook[1].read(), batches))
             return MagicMock()
 
         worker.post = capture
@@ -158,6 +171,7 @@ class AirTests(unittest.TestCase):
             worker.process({"run_id": "c" * 32, "filename": "queries.txt", "queries": ["one", "two"]})
         self.assertEqual([0, 1, 1, 2], [item[0] for item in progress])
         self.assertEqual("/worker/jobs/cccccccccccccccccccccccccccccccc/complete", uploads[0][0])
+        self.assertEqual(["amex_air_batch_1.xlsx"], [batch[0] for batch in uploads[0][3]])
         workbook = load_workbook(io.BytesIO(uploads[0][2]), read_only=True, data_only=True)
         self.assertEqual("answer: one", workbook["Responses"]["C2"].value)
         workbook.close()
@@ -174,10 +188,11 @@ class AirTests(unittest.TestCase):
 
         worker = RemoteWorker("https://example.test", "secret", worker_id="laptop")
         uploads = []
-        worker.update = lambda _run_id, completed, _query, _message: completed == 1
+        worker.update = lambda _run_id, completed, _query, _message, **_kwargs: completed == 1
 
         def capture(path, **kwargs):
-            uploads.append((path, kwargs["data"], kwargs["files"]["workbook"][1].read()))
+            workbook = uploaded_file(kwargs["files"], "workbook")
+            uploads.append((path, kwargs["data"], workbook[1].read()))
             return MagicMock()
 
         worker.post = capture
@@ -211,10 +226,11 @@ class AirTests(unittest.TestCase):
         worker = RemoteWorker("https://example.test", "secret", worker_id="laptop")
         updates = []
         uploads = []
-        worker.update = lambda _run_id, completed, query, message: updates.append((completed, query, message)) or False
+        worker.update = lambda _run_id, completed, query, message, **_kwargs: updates.append((completed, query, message)) or False
 
         def capture(path, **kwargs):
-            uploads.append((path, kwargs["data"], kwargs["files"]["workbook"][1].read()))
+            workbook = uploaded_file(kwargs["files"], "workbook")
+            uploads.append((path, kwargs["data"], workbook[1].read()))
             return MagicMock()
 
         worker.post = capture
@@ -232,6 +248,91 @@ class AirTests(unittest.TestCase):
         self.assertEqual("1", str(uploads[0][1]["success_count"]))
         self.assertEqual("0", str(uploads[0][1]["failed_count"]))
 
+    def test_36_queries_create_two_batches_and_one_combined_workbook(self):
+        from unittest.mock import MagicMock, patch
+
+        class FakeCollector:
+            def collect(self, query):
+                return {
+                    "status": "Success", "response": query, "parsed_json": "{}",
+                    "top_blue_links": "[]", "execution_time": 0.1,
+                }
+
+        worker = RemoteWorker("https://example.test", "secret", worker_id="laptop")
+        worker.update = lambda *_args, **_kwargs: False
+        uploads = []
+
+        def capture(path, **kwargs):
+            uploads.append((path, kwargs))
+            return MagicMock()
+
+        worker.post = capture
+        settings = {
+            "AIR_QUERY_DELAY_SECONDS": "0", "AIR_BATCH_REST_EVERY": "0",
+            "AIR_INTER_BATCH_COOLDOWN_SECONDS": "0",
+        }
+        with patch("air.remote_worker.GoogleAIOverviewCollector", FakeCollector), patch.dict("os.environ", settings):
+            worker.process({"run_id": "b" * 32, "filename": "queries.txt", "queries": [f"q{i}" for i in range(36)]})
+
+        files = uploads[0][1]["files"]
+        batches = [value for key, value in files if key == "batches"]
+        self.assertEqual(["amex_air_batch_1.xlsx", "amex_air_batch_2.xlsx"], [item[0] for item in batches])
+        combined = uploaded_file(files, "workbook")
+        book = load_workbook(io.BytesIO(combined[1].read()), read_only=True, data_only=True)
+        self.assertEqual(37, book["Responses"].max_row)
+        book.close()
+
+    def test_persistent_captcha_stops_after_two_retries_with_partial_output(self):
+        from unittest.mock import MagicMock, patch
+
+        attempts = []
+
+        class BlockedCollector:
+            def collect(self, query):
+                attempts.append(query)
+                return {
+                    "status": "Failed",
+                    "response": "Google displayed a CAPTCHA or unusual-traffic block.",
+                    "parsed_json": "", "top_blue_links": "[]", "execution_time": 0.1,
+                }
+
+        worker = RemoteWorker("https://example.test", "secret", worker_id="laptop")
+        worker.update = lambda *_args, **_kwargs: False
+        uploads = []
+        worker.post = lambda path, **kwargs: uploads.append((path, kwargs)) or MagicMock()
+        settings = {
+            "AIR_QUERY_DELAY_SECONDS": "0", "AIR_CAPTCHA_COOLDOWN_SECONDS": "0",
+            "AIR_CAPTCHA_RETRIES": "2", "AIR_BATCH_REST_EVERY": "0",
+        }
+        with patch("air.remote_worker.GoogleAIOverviewCollector", BlockedCollector), patch.dict("os.environ", settings):
+            worker.process({"run_id": "x" * 32, "filename": "queries.txt", "queries": ["blocked", "must not run"]})
+
+        self.assertEqual(["blocked", "blocked", "blocked"], attempts)
+        self.assertEqual("paused", uploads[0][1]["data"]["terminal_state"])
+        self.assertEqual("1", str(uploads[0][1]["data"]["failed_count"]))
+
+    def test_server_exposes_batch_and_combined_downloads(self):
+        run_id = self.upload().get_json()["job"]["run_id"]
+        self.client.post("/worker/claim", json={"worker_id": "laptop"}, headers=self.worker_headers)
+        completed = self.client.post(
+            f"/worker/jobs/{run_id}/complete",
+            data={
+                "worker_id": "laptop", "success_count": "2", "failed_count": "0",
+                "workbook": (io.BytesIO(b"combined"), "amex_air_all_batches.xlsx"),
+                "batches": [
+                    (io.BytesIO(b"batch-one"), "amex_air_batch_1.xlsx"),
+                    (io.BytesIO(b"batch-two"), "amex_air_batch_2.xlsx"),
+                ],
+            },
+            content_type="multipart/form-data",
+            headers=self.worker_headers,
+        )
+        self.assertEqual(200, completed.status_code)
+        job = self.client.get(f"/jobs/{run_id}", headers=self.client_headers).get_json()
+        self.assertEqual(2, len(job["batch_downloads"]))
+        self.assertEqual(b"combined", self.client.get(job["download_url"]).data)
+        self.assertEqual(b"batch-one", self.client.get(job["batch_downloads"][0]["download_url"]).data)
+
     def test_legacy_excel_writer_still_matches_output_contract(self):
         job_root = Path(self.temp.name) / "legacy-job"
         job_root.mkdir()
@@ -245,7 +346,10 @@ class AirTests(unittest.TestCase):
         with patch("air.worker.GoogleAIOverviewCollector", FakeCollector), patch.dict("os.environ", {"AIR_QUERY_DELAY_SECONDS": "0"}):
             run_legacy_worker(job_root)
         workbook = load_workbook(job_root / "amex_air_results.xlsx", read_only=True, data_only=True)
-        self.assertEqual(("Prompt", "Status", "Response", "Parsed JSON", "Execution Time (sec)"), tuple(cell.value for cell in workbook["Responses"][1]))
+        self.assertEqual(
+            ("Prompt", "Status", "Response", "Parsed JSON", "Top 3 Blue Links", "Execution Time (sec)"),
+            tuple(cell.value for cell in workbook["Responses"][1]),
+        )
         workbook.close()
 
 

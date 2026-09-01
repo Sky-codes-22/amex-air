@@ -20,6 +20,7 @@ class GoogleAIOverviewCollector:
     def collect(self, query):
         started = time.monotonic()
         stage = "starting browser"
+        blue_links = []
         try:
             with sync_playwright() as playwright:
                 cdp_url = os.getenv("AIR_CDP_URL", "").strip()
@@ -51,6 +52,37 @@ class GoogleAIOverviewCollector:
                     body_text = page.locator("body").inner_text(timeout=10000)
                     if "unusual traffic" in body_text.lower() or "captcha" in page.url.lower():
                         raise RuntimeError("Google displayed unusual traffic or CAPTCHA verification")
+                    stage = "extracting blue links"
+                    try:
+                        candidates = page.evaluate("""
+                        () => Array.from(document.querySelectorAll(
+                          '#search a:has(h3), #tads a:has(div[role="heading"]), #tadsb a:has(div[role="heading"])'
+                        )).filter(a => !a.closest("div[jsname='KFl8ub']") && a.href).map(a => {
+                          const headline = (a.querySelector('h3, div[role="heading"]')?.innerText || '').trim();
+                          let sponsored = false, node = a;
+                          for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+                            const labels = Array.from(node.querySelectorAll('span, div'));
+                            const aria = node.getAttribute?.('aria-label') || '';
+                            if (labels.some(x => /^(Sponsored|Ad)$/i.test((x.innerText || '').trim())) ||
+                                /\b(Sponsored|Ad)\b/i.test(aria)) { sponsored = true; break; }
+                          }
+                          return {headline, sponsored};
+                        })
+                        """)
+                        seen = set()
+                        for candidate in candidates:
+                            headline = str(candidate.get("headline", "")).strip()
+                            if not headline or headline.casefold() in seen:
+                                continue
+                            seen.add(headline.casefold())
+                            blue_links.append({
+                                "headline": headline,
+                                "sponsored": bool(candidate.get("sponsored", False)),
+                            })
+                            if len(blue_links) == 3:
+                                break
+                    except Exception:
+                        blue_links = []
                     stage = "ai_overview"
                     overview = None
                     deadline = time.monotonic() + 20
@@ -78,10 +110,19 @@ class GoogleAIOverviewCollector:
                         seen.add(url)
                         sources.append({"url": url, "title": str(link.get("title") or "").strip(), "domain": urlparse(url).netloc.lower().removeprefix("www.")})
                     document = {"query": query, "engine": "Google AI Overview", "blocks": [{"type": "intro", "text": response}], "sources": sources}
-                    return {"status": "Success", "response": response, "parsed_json": json.dumps(document, ensure_ascii=False, indent=2), "execution_time": round(time.monotonic() - started, 2)}
+                    return {
+                        "status": "Success", "response": response,
+                        "parsed_json": json.dumps(document, ensure_ascii=False, indent=2),
+                        "top_blue_links": json.dumps(blue_links, ensure_ascii=False),
+                        "execution_time": round(time.monotonic() - started, 2)
+                    }
                 finally:
                     page.close()
                     if not connected_browser:
                         browser.close()
         except Exception as error:
-            return {"status": "Failed", "response": explain(error, stage), "parsed_json": "", "execution_time": round(time.monotonic() - started, 2)}
+            return {
+                "status": "Failed", "response": explain(error, stage), "parsed_json": "",
+                "top_blue_links": json.dumps(blue_links, ensure_ascii=False),
+                "execution_time": round(time.monotonic() - started, 2)
+            }

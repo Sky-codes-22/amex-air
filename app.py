@@ -11,6 +11,7 @@ from flask import Flask, abort, jsonify, render_template, request, send_file, ur
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from air.inputs import InputError, read_queries
+from air.excel_output import results_bytes
 from air.store import JobStore
 
 ROOT = Path(__file__).resolve().parent
@@ -63,7 +64,16 @@ def create_app(test_config=None):
     @app.get("/jobs")
     def jobs():
         owner = client_id()
-        return jsonify(jobs=store.list_jobs(owner), worker=store.worker_status())
+        return jsonify(jobs=[with_download_urls(job) for job in store.list_jobs(owner)], worker=store.worker_status())
+
+    def with_download_urls(job):
+        if job.get("download_token"):
+            job["download_url"] = url_for(
+                "download", run_id=job["run_id"], token=job.pop("download_token")
+            )
+        for artifact in job.get("batch_downloads", []):
+            artifact["download_url"] = url_for("download_artifact", token=artifact.pop("token"))
+        return job
 
     @app.post("/jobs")
     def start_job():
@@ -90,16 +100,14 @@ def create_app(test_config=None):
         job = store.get_job(valid_run_id(run_id), client_id())
         if not job:
             abort(404)
-        if job.get("download_token"):
-            job["download_url"] = url_for("download", run_id=run_id, token=job.pop("download_token"))
-        return jsonify(job)
+        return jsonify(with_download_urls(job))
 
     @app.post("/jobs/<run_id>/cancel")
     def cancel(run_id):
-        job = store.cancel(valid_run_id(run_id), client_id())
+        job = store.cancel(valid_run_id(run_id), client_id(), empty_workbook=results_bytes([]))
         if not job:
             abort(404)
-        return jsonify(job=job)
+        return jsonify(job=with_download_urls(job))
 
     @app.get("/jobs/<run_id>/download")
     def download(run_id):
@@ -113,6 +121,21 @@ def create_app(test_config=None):
             BytesIO(workbook),
             as_attachment=True,
             download_name=f"amex_air_{stem}.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    @app.get("/artifacts/<token>/download")
+    def download_artifact(token):
+        if not re.fullmatch(r"[a-f0-9]{32}", token):
+            abort(404)
+        result = store.artifact(token)
+        if not result:
+            abort(404)
+        workbook, filename = result
+        return send_file(
+            BytesIO(workbook),
+            as_attachment=True,
+            download_name=filename,
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
@@ -151,6 +174,7 @@ def create_app(test_config=None):
             completed=data.get("completed", 0),
             current_query=data.get("current_query"),
             message=data.get("message"),
+            cooldown_until=data.get("cooldown_until"),
         )
         if result is None:
             abort(409)
@@ -164,12 +188,25 @@ def create_app(test_config=None):
         upload = request.files.get("workbook")
         if not upload:
             return jsonify(error="A completed workbook is required."), 400
+        artifacts = []
+        for batch_number, batch in enumerate(request.files.getlist("batches"), start=1):
+            match = re.search(r"batch[_ -]?(\d+)", batch.filename or "", re.IGNORECASE)
+            number = int(match.group(1)) if match else batch_number
+            artifacts.append({
+                "token": uuid.uuid4().hex,
+                "filename": batch.filename or f"amex_air_batch_{number}.xlsx",
+                "batch_number": number,
+                "workbook": batch.read(),
+            })
         state = store.complete(
             valid_run_id(run_id),
             request.form.get("worker_id", "")[:80],
             workbook=upload.read(),
             success_count=request.form.get("success_count", 0),
             failed_count=request.form.get("failed_count", 0),
+            artifacts=artifacts,
+            terminal_state=request.form.get("terminal_state", "completed"),
+            terminal_message=request.form.get("terminal_message"),
         )
         if not state:
             abort(409)

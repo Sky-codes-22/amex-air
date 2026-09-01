@@ -8,6 +8,7 @@ from openpyxl import load_workbook
 
 
 MAX_QUERIES = 500
+BATCH_SIZE = 35
 
 
 class InputError(ValueError):
@@ -25,7 +26,7 @@ def _clean(values):
     if not queries:
         raise InputError("No non-empty queries were found in the uploaded file.")
     if len(queries) > MAX_QUERIES:
-        raise InputError(f"A single batch may contain at most {MAX_QUERIES} unique queries.")
+        raise InputError(f"An upload may contain at most {MAX_QUERIES} unique queries.")
     return queries
 
 
