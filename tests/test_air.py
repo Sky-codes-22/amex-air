@@ -196,6 +196,28 @@ class AirTests(unittest.TestCase):
         self.assertEqual("answer: one", workbook["Responses"]["C2"].value)
         workbook.close()
 
+    def test_laptop_worker_retries_transient_render_errors(self):
+        import requests
+        from unittest.mock import MagicMock, patch
+
+        worker = RemoteWorker("https://example.test", "secret", worker_id="laptop")
+        unavailable = MagicMock()
+        unavailable.status_code = 502
+        transient_error = requests.HTTPError(response=unavailable)
+        failed_response = MagicMock()
+        failed_response.raise_for_status.side_effect = transient_error
+        recovered_response = MagicMock()
+        worker.session.post = MagicMock(
+            side_effect=[failed_response, recovered_response]
+        )
+
+        with patch("air.remote_worker.time.sleep") as sleep:
+            response = worker.post("/worker/heartbeat", json={"worker_id": "laptop"})
+
+        self.assertIs(recovered_response, response)
+        self.assertEqual(2, worker.session.post.call_count)
+        sleep.assert_called_once_with(2)
+
     def test_laptop_worker_uploads_partial_workbook_when_cancelled(self):
         from unittest.mock import MagicMock, patch
 

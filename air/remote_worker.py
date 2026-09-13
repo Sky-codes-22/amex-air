@@ -27,9 +27,27 @@ class RemoteWorker:
         self.session.headers.update({"Authorization": f"Bearer {token}"})
 
     def post(self, path, **kwargs):
-        response = self.session.post(f"{self.server_url}{path}", timeout=120, **kwargs)
-        response.raise_for_status()
-        return response
+        attempts = 3 if "files" not in kwargs else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.session.post(
+                    f"{self.server_url}{path}", timeout=120, **kwargs
+                )
+                response.raise_for_status()
+                return response
+            except requests.RequestException as error:
+                status = getattr(getattr(error, "response", None), "status_code", None)
+                retryable = status in {502, 503, 504} or status is None
+                if not retryable or attempt == attempts:
+                    raise
+                delay = attempt * 2
+                print(
+                    f"Temporary worker connection error on {path} "
+                    f"(attempt {attempt} of {attempts}); retrying in {delay} seconds.",
+                    flush=True,
+                )
+                time.sleep(delay)
+        raise RuntimeError("Worker request retry loop ended unexpectedly")
 
     def heartbeat(self):
         self.post("/worker/heartbeat", json={"worker_id": self.worker_id})
