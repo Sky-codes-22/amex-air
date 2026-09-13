@@ -23,7 +23,7 @@ from air.local_runner import (
     find_chrome_executable,
     run as run_local,
 )
-from air.remote_worker import RemoteWorker
+from air.remote_worker import RemoteWorker, _laptop_collector
 from air.screenshots import ScreenshotRun, sanitize_screenshot_stem, save_qc_screenshot
 from air.serp_diagnostic import inspect_dom
 from air.worker import main as run_legacy_worker
@@ -217,6 +217,29 @@ class AirTests(unittest.TestCase):
         self.assertIs(recovered_response, response)
         self.assertEqual(2, worker.session.post.call_count)
         sleep.assert_called_once_with(2)
+
+    def test_laptop_worker_uses_headed_installed_chrome_and_persistent_profile(self):
+        from unittest.mock import MagicMock, patch
+
+        profile = Path(self.temp.name) / "remote-profile"
+        fake_collector = MagicMock()
+        settings = {
+            "AIR_REMOTE_CHROME_EXECUTABLE": str(self.chrome_executable),
+            "AIR_REMOTE_PROFILE_DIR": str(profile),
+        }
+        with patch.dict("os.environ", settings), patch(
+            "air.remote_worker.GoogleAIOverviewCollector",
+            return_value=fake_collector,
+        ):
+            collector = _laptop_collector()
+
+        self.assertIs(fake_collector, collector)
+        self.assertFalse(collector.headless)
+        self.assertFalse(collector.use_cdp)
+        self.assertEqual(str(profile.resolve()), collector.user_data_dir)
+        self.assertEqual(str(self.chrome_executable.resolve()), collector.executable_path)
+        self.assertTrue(collector.resolve_top_links_only)
+        self.assertTrue(profile.is_dir())
 
     def test_laptop_worker_uploads_partial_workbook_when_cancelled(self):
         from unittest.mock import MagicMock, patch

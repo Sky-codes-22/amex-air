@@ -16,6 +16,35 @@ import requests
 from air.collector import GoogleAIOverviewCollector
 from air.excel_output import write_results
 from air.inputs import BATCH_SIZE
+from air.local_runner import DEFAULT_PROFILE_DIR, find_chrome_executable
+
+
+def _laptop_collector():
+    configured_chrome = os.getenv("AIR_REMOTE_CHROME_EXECUTABLE", "").strip()
+    chrome_path = (
+        Path(configured_chrome).expanduser().resolve()
+        if configured_chrome
+        else find_chrome_executable()
+    )
+    if not chrome_path.is_file():
+        raise FileNotFoundError(
+            f"Google Chrome executable was not found: {chrome_path}"
+        )
+    profile_path = Path(
+        os.getenv("AIR_REMOTE_PROFILE_DIR", str(DEFAULT_PROFILE_DIR))
+    ).expanduser().resolve()
+    profile_path.mkdir(parents=True, exist_ok=True)
+    print("Worker browser: Google Chrome (headed)", flush=True)
+    print(f"Chrome executable: {chrome_path}", flush=True)
+    print(f"Worker profile: {profile_path}", flush=True)
+    collector = GoogleAIOverviewCollector()
+    collector.headless = False
+    collector.use_cdp = False
+    collector.user_data_dir = str(profile_path)
+    collector.manual_captcha_timeout = 0
+    collector.executable_path = str(chrome_path)
+    collector.resolve_top_links_only = True
+    return collector
 
 
 class RemoteWorker:
@@ -126,7 +155,7 @@ class RemoteWorker:
     def process(self, job):
         run_id = job["run_id"]
         queries = job["queries"]
-        collector = GoogleAIOverviewCollector()
+        collector = _laptop_collector()
         rows = []
         legacy_setting = os.getenv("AIR_QUERY_DELAY_SECONDS")
         legacy_delay = float(legacy_setting) if legacy_setting is not None else 10
