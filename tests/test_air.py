@@ -6,8 +6,26 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
+from air.ad_ranking import analyze_sponsored_ads, identify_brand
+from air.collector import (
+    DestinationURLResolver,
+    _blue_link_candidates,
+    _resolve_destination,
+    _resolve_structure_urls,
+    _serp_snapshot,
+    _serp_position,
+    _serp_structure,
+    _top_blue_links_from_structure,
+)
 from air.inputs import InputError, read_queries
+from air.local_runner import (
+    chrome_executable_candidates,
+    find_chrome_executable,
+    run as run_local,
+)
 from air.remote_worker import RemoteWorker
+from air.screenshots import ScreenshotRun, sanitize_screenshot_stem, save_qc_screenshot
+from air.serp_diagnostic import inspect_dom
 from air.worker import main as run_legacy_worker
 from app import create_app
 
@@ -20,6 +38,8 @@ def uploaded_file(files, field):
 class AirTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.chrome_executable = Path(self.temp.name) / "chrome.exe"
+        self.chrome_executable.write_bytes(b"test chrome")
         database = Path(self.temp.name) / "air-test.db"
         self.app = create_app({
             "TESTING": True,
@@ -347,7 +367,14 @@ class AirTests(unittest.TestCase):
             run_legacy_worker(job_root)
         workbook = load_workbook(job_root / "amex_air_results.xlsx", read_only=True, data_only=True)
         self.assertEqual(
-            ("Prompt", "Status", "Response", "Parsed JSON", "Top 3 Blue Links", "Execution Time (sec)"),
+            (
+                "Prompt", "Status", "Response", "Parsed JSON", "Top 3 Blue Links",
+                "Execution Time (sec)", "SERP First Element", "AI Overview Position",
+                "AI Overview On Top", "SERP Order JSON", "AIO Ad Present", "AIO Ad Count",
+                "AIO Ads JSON", "Sponsored Ads JSON", "Sponsored Ad Count",
+                "AMEX Sponsored Ad Present", "AMEX Sponsored Ad Rank", "AMEX SERP Rank",
+                "Brands in Sponsored Ads", "AMEX Ad Competitive Position",
+            ),
             tuple(cell.value for cell in workbook["Responses"][1]),
         )
         workbook.close()
@@ -364,13 +391,988 @@ class AirTests(unittest.TestCase):
             io.BytesIO(results_bytes([{
                 "prompt": "query", "status": "Success", "response": "answer",
                 "parsed_json": "{}", "top_blue_links": json.dumps(links),
+                "serp_first_element": "AI Overview", "ai_overview_position": 1,
+                "ai_overview_on_top": True, "serp_order_json": '[{"rank": 1, "type": "AI Overview"}]',
+                "aio_ad_present": False, "aio_ad_count": 0, "aio_ads_json": "[]",
+                "sponsored_ads_json": "[]", "sponsored_ad_count": 0,
+                "amex_sponsored_ad_present": False, "amex_sponsored_ad_rank": None,
+                "amex_serp_rank": None, "brands_in_sponsored_ads": "",
+                "amex_ad_competitive_position": "No Sponsored Ads",
                 "execution_time": 0.1,
             }])),
             read_only=True,
             data_only=True,
         )
         self.assertEqual(links, json.loads(workbook["Responses"]["E2"].value))
+        self.assertEqual("AI Overview", workbook["Responses"]["G2"].value)
+        self.assertEqual(1, workbook["Responses"]["H2"].value)
+        self.assertIs(True, workbook["Responses"]["I2"].value)
+        self.assertEqual([{"rank": 1, "type": "AI Overview"}], json.loads(workbook["Responses"]["J2"].value))
+        self.assertIs(False, workbook["Responses"]["K2"].value)
+        self.assertEqual(0, workbook["Responses"]["L2"].value)
+        self.assertEqual([], json.loads(workbook["Responses"]["M2"].value))
+        self.assertEqual([], json.loads(workbook["Responses"]["N2"].value))
+        self.assertEqual(0, workbook["Responses"]["O2"].value)
+        self.assertIs(False, workbook["Responses"]["P2"].value)
+        self.assertEqual("No Sponsored Ads", workbook["Responses"]["T2"].value)
         workbook.close()
+
+    def test_excel_derives_amex_serp_rank_from_organic_americanexpress_url(self):
+        from air.excel_output import results_bytes
+
+        wrapper = "https://www.google.com/goto?url=opaque-amex"
+        structure = [
+            {"rank": 1, "type": "AI Overview"},
+            {
+                "rank": 2, "type": "Organic", "headline": "American Express",
+                "url": wrapper, "raw_url": wrapper, "sponsored": False,
+            },
+            {
+                "rank": 3, "type": "Sponsored", "headline": "American Express ad",
+                "url": "https://www.americanexpress.com/ad", "raw_url": "https://www.americanexpress.com/ad",
+                "sponsored": True,
+            },
+        ]
+        top_links = [{
+            "headline": "American Express", "url": "https://www.americanexpress.com/us/credit-cards/",
+            "raw_url": wrapper, "sponsored": False,
+        }]
+        row = {
+            "prompt": "american express card", "status": "Success", "response": "answer",
+            "parsed_json": "{}", "top_blue_links": json.dumps(top_links),
+            "serp_order_json": json.dumps(structure), "execution_time": 0.1,
+        }
+        workbook = load_workbook(
+            io.BytesIO(results_bytes([row])), read_only=True, data_only=True
+        )
+        self.assertEqual(2, workbook["Responses"]["R2"].value)
+        workbook.close()
+
+    def test_production_snapshot_captures_aio_side_cards_separately(self):
+        from playwright.sync_api import sync_playwright
+
+        markup = """
+        <main id="search">
+          <div jsname="KFl8ub" style="position:relative;width:800px;height:280px">
+            <div style="position:absolute;left:0;top:20px;width:380px;height:120px">
+              AI response <a href="https://citation.example">Citation</a>
+            </div>
+            <a href="https://www.americanexpress.com/card" style="position:absolute;display:block;left:500px;top:20px;width:250px;height:80px">
+              <h3>American Express Credit Cards</h3><span>Rewards and banking</span>
+            </a>
+            <a href="https://www.americanexpress.com/login" style="position:absolute;display:block;left:500px;top:115px;width:250px;height:80px">
+              <h3>Log in to My Account</h3>
+            </a>
+          </div>
+          <a href="https://organic.example" style="position:absolute;display:block;top:320px;width:400px;height:50px"><h3>Organic result</h3></a>
+        </main>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(markup)
+                snapshot = _serp_snapshot(page)
+            finally:
+                browser.close()
+
+        self.assertTrue(snapshot["aio_present"])
+        self.assertEqual(2, len(snapshot["aio_ads"]))
+        self.assertEqual(
+            ["American Express Credit Cards", "Log in to My Account"],
+            [item["headline"] for item in snapshot["aio_ads"]],
+        )
+        self.assertTrue(all(item["position"] == "right" for item in snapshot["aio_ads"]))
+        self.assertTrue(all(item["label"] == "AIO side card" for item in snapshot["aio_ads"]))
+
+    def test_sponsored_ad_brand_ranking_scenarios(self):
+        def result(rank, brand_url, headline, result_type="Sponsored"):
+            return {
+                "rank": rank,
+                "type": result_type,
+                "headline": headline,
+                "url": brand_url,
+                "raw_url": brand_url,
+                "sponsored": result_type == "Sponsored",
+            }
+
+        chase_amex_capital_one = analyze_sponsored_ads([
+            result(1, "https://creditcards.chase.com/card", "Chase card"),
+            result(2, "https://www.americanexpress.com/card", "American Express card"),
+            result(3, "https://www.capitalone.com/card", "Capital One card"),
+        ])
+        self.assertEqual(3, chase_amex_capital_one["sponsored_ad_count"])
+        self.assertEqual(2, chase_amex_capital_one["amex_sponsored_ad_rank"])
+        self.assertEqual(2, chase_amex_capital_one["amex_serp_rank"])
+        self.assertEqual("2nd", chase_amex_capital_one["amex_ad_competitive_position"])
+        self.assertEqual(
+            "Chase | American Express | Capital One",
+            chase_amex_capital_one["brands_in_sponsored_ads"],
+        )
+
+        amex_first = analyze_sponsored_ads([
+            result(1, "https://americanexpress.com/one", "AMEX one"),
+            result(2, "https://chase.com/two", "Chase two"),
+        ])
+        self.assertEqual(1, amex_first["amex_sponsored_ad_rank"])
+        self.assertEqual("1st", amex_first["amex_ad_competitive_position"])
+
+        competitors_only = analyze_sponsored_ads([
+            result(1, "https://chase.com", "Chase"),
+            result(2, "https://citi.com", "Citi"),
+        ])
+        self.assertFalse(competitors_only["amex_sponsored_ad_present"])
+        self.assertEqual("No AMEX Ad", competitors_only["amex_ad_competitive_position"])
+
+        no_ads = analyze_sponsored_ads([
+            result(1, "https://americanexpress.com", "American Express", "Organic"),
+            {"rank": 2, "type": "AI Overview"},
+        ])
+        self.assertEqual(0, no_ads["sponsored_ad_count"])
+        self.assertFalse(no_ads["amex_sponsored_ad_present"])
+        self.assertIsNone(no_ads["amex_sponsored_ad_rank"])
+        self.assertEqual("No Sponsored Ads", no_ads["amex_ad_competitive_position"])
+        self.assertEqual("American Express", no_ads["serp_structure"][0]["brand"])
+        self.assertNotIn("brand", no_ads["serp_structure"][1])
+
+        unknown = analyze_sponsored_ads([
+            result(1, "https://unknown-advertiser.example", "Excellent card offer"),
+        ])
+        self.assertEqual("UNKNOWN", unknown["sponsored_ads"][0]["brand"])
+        self.assertEqual("UNKNOWN", unknown["brands_in_sponsored_ads"])
+
+        multiple_amex = analyze_sponsored_ads([
+            result(1, "https://americanexpress.com/first", "First AMEX"),
+            result(2, "https://chase.com", "Chase"),
+            result(3, "https://americanexpress.com/second", "Second AMEX"),
+        ])
+        self.assertEqual(1, multiple_amex["amex_sponsored_ad_rank"])
+        self.assertEqual(1, multiple_amex["amex_serp_rank"])
+
+    def test_brand_matching_domain_priority_and_publisher_exclusion(self):
+        self.assertEqual(
+            "UNKNOWN",
+            identify_brand({
+                "headline": "Best American Express credit cards",
+                "url": "https://www.nerdwallet.com/credit-cards/amex",
+            }),
+        )
+        self.assertEqual(
+            "American Express",
+            identify_brand({
+                "headline": "Compare Chase card offers",
+                "url": "https://www.americanexpress.com/us/cards",
+            }),
+        )
+
+    def test_serp_position_uses_visible_rendered_order(self):
+        from playwright.sync_api import sync_playwright
+
+        def aio(top, extra=""):
+            return f'<div jsname="KFl8ub" style="position:absolute;top:{top}px;width:400px;height:40px;{extra}">AI Overview</div>'
+
+        def organic(top, headline="Organic", extra=""):
+            return (
+                f'<div style="position:absolute;top:{top}px;{extra}">'
+                f'<a href="https://example.com/{top}" style="display:block;width:400px;height:40px"><h3>{headline}</h3></a>'
+                "</div>"
+            )
+
+        def sponsored(top, headline="Sponsored"):
+            return (
+                f'<div data-text-ad style="position:absolute;top:{top}px">'
+                f'<span> Sponsored </span><a href="https://ads.example/{top}" '
+                f'style="display:block;width:400px;height:40px"><h3>{headline}</h3></a></div>'
+            )
+
+        cases = [
+            ("aio first", aio(10) + organic(100), "AI Overview", 1, True),
+            ("organic first", organic(10) + aio(100), "Organic", 2, False),
+            ("sponsored first", sponsored(10) + aio(100), "Sponsored", 2, False),
+            (
+                "multiple before aio",
+                sponsored(10, "Ad one") + organic(50) + sponsored(90, "Ad two") + aio(130),
+                "Sponsored", 4, False,
+            ),
+            ("no aio", organic(10), "Organic", None, None),
+            ("invisible ignored", organic(10, extra="display:none") + aio(100), "AI Overview", 1, True),
+            ("visual differs from dom", aio(200) + organic(20), "Organic", 2, False),
+        ]
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                for name, contents, first, aio_position, on_top in cases:
+                    with self.subTest(name=name):
+                        page.set_content(f'<div id="search">{contents}</div>')
+                        position = _serp_position(page)
+                        self.assertEqual(first, position["serp_first_element"])
+                        self.assertEqual(aio_position, position["ai_overview_position"])
+                        self.assertEqual(on_top, position["ai_overview_on_top"])
+            finally:
+                browser.close()
+
+    def test_aio_ad_diagnostic_fixtures_require_positive_sponsorship(self):
+        from playwright.sync_api import sync_playwright
+
+        fixtures = [
+            (
+                "normal citation card",
+                '<div jsname="KFl8ub"><div role="listitem"><a href="https://source.example">Citation source</a></div></div>',
+                0,
+            ),
+            (
+                "explicit sponsored label",
+                '<div jsname="KFl8ub"><div role="listitem"><span> Sponsored </span><a href="https://ad.example">Offer</a></div></div>',
+                1,
+            ),
+            (
+                "explicit aria ad label",
+                '<div jsname="KFl8ub"><div role="listitem"><span aria-label="Ad">Promotion</span><a href="https://ad.example">Offer</a></div></div>',
+                1,
+            ),
+            (
+                "multiple aio ads",
+                '<div jsname="KFl8ub"><div role="listitem"><span>Sponsored</span><a href="https://one.example">One</a></div>'
+                '<div role="listitem"><span>Ad</span><a href="https://two.example">Two</a></div></div>',
+                2,
+            ),
+            ("aio with no cards", '<div jsname="KFl8ub">AI response only</div>', 0),
+            (
+                "no aio",
+                '<div data-text-ad><span>Sponsored</span><a href="https://outside.example">Outside ad</a></div>',
+                0,
+            ),
+            (
+                "ad-like unlabeled product card",
+                '<div jsname="KFl8ub"><div role="listitem" data-product-id="card-1">'
+                '<a href="https://issuer.example/apply">Apply now</a></div></div>',
+                0,
+            ),
+        ]
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                for name, markup, expected_signals in fixtures:
+                    with self.subTest(name=name):
+                        page.set_content(f'<main id="search">{markup}</main>')
+                        evidence = inspect_dom(page)
+                        self.assertEqual(expected_signals, len(evidence["aio_sponsorship_signals"]))
+                        explicit_cards = [
+                            card for card in evidence["aio_linked_card_structures"]
+                            if card["explicit_sponsorship"]
+                        ]
+                        self.assertEqual(expected_signals, len(explicit_cards))
+            finally:
+                browser.close()
+
+    def test_serp_structure_is_unified_deduplicated_and_visually_ordered(self):
+        from playwright.sync_api import sync_playwright
+        from unittest.mock import patch
+
+        markup = """
+        <div id="search">
+          <div jsname="KFl8ub" style="position:absolute;top:100px;width:400px;height:40px">
+            AI Overview
+            <a href="https://aio.example/source" style="display:block;width:200px;height:20px"><h3>AIO citation</h3></a>
+          </div>
+          <div style="position:absolute;top:140px"><a href="https://after.example" style="display:block;width:400px;height:40px"><h3>Organic after</h3></a></div>
+          <div data-text-ad style="position:absolute;top:20px"><span>Sponsored</span><a href="https://www.google.com/goto?url=ad" style="display:block;width:400px;height:40px"><h3>Sponsored result</h3></a></div>
+          <div style="position:absolute;top:40px"><a href="https://one.example" style="display:block;width:400px;height:40px"><h3>Organic one</h3></a></div>
+          <div style="position:absolute;top:60px"><a href="https://two.example" style="display:block;width:400px;height:40px"><h3>Organic two</h3></a></div>
+          <div style="display:none"><a href="https://hidden.example"><h3>Hidden result</h3></a></div>
+          <div style="position:absolute;top:220px">
+            <a href="https://duplicate.example" style="display:block;width:400px;height:40px"><h3>Duplicate result</h3></a>
+            <a href="https://duplicate.example" style="display:block;width:400px;height:40px"><h3>Duplicate result</h3></a>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(markup)
+                class StubResolver:
+                    def resolve(self, url):
+                        return "https://ad.example" if "goto" in url else url
+
+                structure = _serp_structure(page, object(), resolver=StubResolver())
+            finally:
+                browser.close()
+
+        self.assertEqual(list(range(1, 7)), [entry["rank"] for entry in structure])
+        self.assertEqual(
+            ["Sponsored", "Organic", "Organic", "AI Overview", "Organic", "Organic"],
+            [entry["type"] for entry in structure],
+        )
+        self.assertEqual("https://ad.example", structure[0]["url"])
+        self.assertTrue(structure[0]["sponsored"])
+        self.assertEqual("AI Overview", structure[3]["type"])
+        self.assertNotIn("headline", structure[3])
+        headlines = [entry.get("headline") for entry in structure]
+        self.assertNotIn("AIO citation", headlines)
+        self.assertNotIn("Hidden result", headlines)
+        self.assertEqual(1, headlines.count("Duplicate result"))
+
+    def test_serp_structure_without_aio_contains_only_results(self):
+        from playwright.sync_api import sync_playwright
+
+        markup = '<div id="search"><a href="https://example.com" style="display:block;width:400px;height:40px"><h3>Only result</h3></a></div>'
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(markup)
+                structure = _serp_structure(page, object())
+            finally:
+                browser.close()
+        self.assertEqual([{
+            "rank": 1,
+            "type": "Organic",
+            "headline": "Only result",
+            "url": "https://example.com/",
+            "raw_url": "https://example.com/",
+            "sponsored": False,
+        }], structure)
+
+    def test_blue_link_dom_detection_excludes_aio_and_marks_sponsored(self):
+        from playwright.sync_api import sync_playwright
+
+        markup = """
+        <style>a { display: block; height: 40px; }</style>
+        <div id="search">
+          <div jsname="KFl8ub"><a href="https://aio.example/source"><h3>AIO source</h3></a></div>
+          <div><a href="https://organic.example/page"><h3>Organic result</h3></a></div>
+          <div data-text-ad><span>Sponsored</span><a href="https://ad.example/page"><h3>Data ad</h3></a></div>
+          <section><span>  AD  </span><a href="https://label-ad.example/page"><h3>Label ad</h3></a></section>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(markup)
+                candidates = _blue_link_candidates(page)
+            finally:
+                browser.close()
+
+        self.assertEqual(
+            ["Organic result", "Data ad", "Label ad"],
+            [candidate["headline"] for candidate in candidates],
+        )
+        self.assertEqual([False, True, True], [candidate["sponsored"] for candidate in candidates])
+        self.assertNotIn("AIO source", [candidate["headline"] for candidate in candidates])
+
+    def test_blue_link_destination_resolution_and_fallback(self):
+        class FakePage:
+            def __init__(self, final_url):
+                self.url = "about:blank"
+                self.final_url = final_url
+                self.closed = False
+
+            def goto(self, *_args, **_kwargs):
+                self.url = self.final_url
+
+            def wait_for_timeout(self, _milliseconds):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self, final_url):
+                self.page = FakePage(final_url)
+                self.calls = 0
+
+            def new_page(self):
+                self.calls += 1
+                return self.page
+
+        external_context = FakeContext("https://unused.example")
+        external = "https://example.com/page"
+        self.assertEqual(external, _resolve_destination(external_context, external))
+        self.assertEqual(0, external_context.calls)
+
+        wrapper = "https://www.google.com/goto?url=opaque"
+        resolved_context = FakeContext("https://destination.example/page")
+        self.assertEqual(
+            "https://destination.example/page",
+            _resolve_destination(resolved_context, wrapper),
+        )
+        self.assertTrue(resolved_context.page.closed)
+
+        fallback_context = FakeContext(wrapper)
+        self.assertEqual(wrapper, _resolve_destination(fallback_context, wrapper, timeout=0))
+        self.assertTrue(fallback_context.page.closed)
+
+    def test_resolver_skips_external_urls_reuses_one_page_and_caches_wrappers(self):
+        class FakePage:
+            def __init__(self):
+                self.url = "about:blank"
+                self.goto_calls = []
+                self.closed = False
+
+            def is_closed(self):
+                return self.closed
+
+            def goto(self, url, **_kwargs):
+                self.goto_calls.append(url)
+                token = url.rsplit("=", 1)[-1]
+                self.url = f"https://destination.example/{token}"
+
+            def wait_for_timeout(self, _milliseconds):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self):
+                self.page = FakePage()
+                self.new_page_calls = 0
+
+            def new_page(self):
+                self.new_page_calls += 1
+                return self.page
+
+        context = FakeContext()
+        resolver = DestinationURLResolver(context)
+        self.assertEqual("https://external.example/page", resolver.resolve("https://external.example/page"))
+        first = resolver.resolve("/goto?url=one")
+        repeated = resolver.resolve("/goto?url=one")
+        second = resolver.resolve("https://www.google.com/goto?url=two")
+
+        self.assertEqual("https://destination.example/one", first)
+        self.assertEqual(first, repeated)
+        self.assertEqual("https://destination.example/two", second)
+        self.assertEqual(1, context.new_page_calls)
+        self.assertEqual(2, len(context.page.goto_calls))
+        self.assertEqual(2, resolver.navigation_count)
+        self.assertEqual(1, resolver.cache_hits)
+
+    def test_only_top_three_structure_results_are_resolved(self):
+        class FakePage:
+            def __init__(self):
+                self.url = "about:blank"
+                self.goto_calls = []
+
+            def is_closed(self):
+                return False
+
+            def goto(self, url, **_kwargs):
+                self.goto_calls.append(url)
+                self.url = f"https://resolved.example/{len(self.goto_calls)}"
+
+            def wait_for_timeout(self, _milliseconds):
+                pass
+
+        class FakeContext:
+            def __init__(self):
+                self.page = FakePage()
+
+            def new_page(self):
+                return self.page
+
+        structure = [{
+            "rank": number,
+            "type": "Organic",
+            "headline": f"Result {number}",
+            "url": f"https://www.google.com/goto?url={number}",
+            "raw_url": f"https://www.google.com/goto?url={number}",
+            "sponsored": False,
+        } for number in range(1, 7)]
+        context = FakeContext()
+        resolver = DestinationURLResolver(context)
+        resolved = _resolve_structure_urls(structure, resolver, limit=3)
+
+        self.assertEqual(3, resolver.navigation_count)
+        self.assertEqual(3, len(context.page.goto_calls))
+        self.assertTrue(all(item["url"].startswith("https://resolved.example/") for item in resolved[:3]))
+        self.assertTrue(all(item["url"] == item["raw_url"] for item in resolved[3:]))
+
+    def test_collector_uses_one_serp_navigation_and_one_snapshot(self):
+        from unittest.mock import patch
+        from air.collector import GoogleAIOverviewCollector
+
+        class FakeLocator:
+            def __init__(self, kind):
+                self.kind = kind
+
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return 1
+
+            def is_visible(self):
+                return True
+
+            def inner_text(self, **_kwargs):
+                return "ordinary results" if self.kind == "body" else "AI answer"
+
+            def locator(self, _selector):
+                return self
+
+            def evaluate_all(self, _script):
+                return []
+
+        class FakePage:
+            url = "about:blank"
+
+            def __init__(self):
+                self.goto_calls = []
+                self.wait_calls = []
+
+            def goto(self, url, **_kwargs):
+                self.goto_calls.append(url)
+                self.url = url
+
+            def locator(self, selector):
+                return FakeLocator("body" if selector == "body" else "overview")
+
+            def wait_for_timeout(self, _milliseconds):
+                self.wait_calls.append(_milliseconds)
+
+            def close(self):
+                pass
+
+        class FakeContext:
+            def __init__(self):
+                self.page = FakePage()
+
+            def new_page(self):
+                return self.page
+
+        snapshot = {
+            "major_blocks": [
+                {"type": "AI Overview", "y": 10},
+                {
+                    "type": "Organic", "headline": "External", "y": 20,
+                    "raw_url": "https://external.example", "sponsored": False,
+                },
+            ],
+            "blue_links": [],
+            "aio_present": True,
+            "aio_ads": [],
+        }
+        collector = GoogleAIOverviewCollector(
+            use_cdp=False,
+            resolve_top_links_only=True,
+            screenshot_delay_min=5,
+            screenshot_delay_max=10,
+        )
+        context = FakeContext()
+        with patch("air.collector._serp_snapshot", return_value=snapshot) as snapshot_call, \
+                patch("air.collector.random.uniform", return_value=7.5), \
+                patch("air.collector.save_qc_screenshot", return_value=True) as screenshot:
+            result = collector._collect_in_context(context, "query", screenshot_path="qc.png")
+
+        self.assertEqual("Success", result["status"])
+        self.assertEqual(1, len(context.page.goto_calls))
+        self.assertEqual(1, snapshot_call.call_count)
+        self.assertEqual({
+            "google_serp_navigations": 1,
+            "external_url_resolution_navigations": 0,
+            "resolution_cache_hits": 0,
+        }, result["navigation_metrics"])
+        self.assertEqual([7500], context.page.wait_calls)
+        screenshot.assert_called_once_with(context.page, "qc.png")
+
+    def test_top_blue_links_preserve_order_limit_and_raw_url(self):
+        from unittest.mock import patch
+
+        candidates = [{
+            "headline": f"Result {index}",
+            "raw_url": f"https://www.google.com/goto?url={index}",
+            "sponsored": index == 1,
+        } for index in range(1, 5)]
+        structure = [
+            {
+                "rank": index,
+                "type": "Sponsored" if candidate["sponsored"] else "Organic",
+                "headline": candidate["headline"],
+                "url": candidate["raw_url"].replace(
+                    "https://www.google.com/goto?url=", "https://example.com/"
+                ),
+                "raw_url": candidate["raw_url"],
+                "sponsored": candidate["sponsored"],
+            }
+            for index, candidate in enumerate(candidates, start=1)
+        ]
+        links = _top_blue_links_from_structure(structure)
+
+        self.assertEqual(3, len(links))
+        self.assertEqual(["Result 1", "Result 2", "Result 3"], [link["headline"] for link in links])
+        self.assertEqual("https://example.com/1", links[0]["url"])
+        self.assertEqual("https://www.google.com/goto?url=1", links[0]["raw_url"])
+        self.assertTrue(links[0]["sponsored"])
+
+    def test_local_runner_uses_local_browser_mode_and_writes_outputs(self):
+        from unittest.mock import patch
+
+        prompt_path = Path(self.temp.name) / "prompts.xlsx"
+        prompt_book = Workbook()
+        prompt_book.active.append(["Prompt"])
+        prompt_book.active.append(["one"])
+        prompt_book.active.append(["two"])
+        prompt_book.save(prompt_path)
+
+        collectors = []
+        screenshot_paths = []
+        lifecycle = []
+
+        class FakeCollector:
+            def __init__(self, **kwargs):
+                collectors.append(kwargs)
+
+            def start(self):
+                lifecycle.append("start")
+
+            def close(self):
+                lifecycle.append("close")
+
+            def collect(self, query, screenshot_path=None, captcha_screenshot_path=None):
+                screenshot_paths.append(Path(screenshot_path))
+                Path(screenshot_path).write_bytes(b"test-png")
+                return {
+                    "status": "Success", "response": f"answer: {query}",
+                    "parsed_json": "{}", "top_blue_links": "[]",
+                    "google_blocked": False,
+                    "execution_time": 0.1,
+                }
+
+        output_dir = Path(self.temp.name) / "local-output"
+        profile_dir = Path(self.temp.name) / "persistent-profile"
+        from air.excel_output import write_results as real_write_results
+        with patch("air.local_runner.GoogleAIOverviewCollector", FakeCollector), \
+                patch("air.local_runner.write_results", wraps=real_write_results) as checkpoint_write:
+            combined = run_local(
+                prompt_path,
+                output_dir,
+                delay_min=0,
+                delay_max=0,
+                break_every=0,
+                profile_dir=profile_dir,
+                chrome_executable=self.chrome_executable,
+            )
+
+        self.assertEqual(
+            [{
+                "headless": False,
+                "use_cdp": False,
+                "user_data_dir": str(profile_dir),
+                "manual_captcha_timeout": 0,
+                "executable_path": str(self.chrome_executable),
+                "resolve_top_links_only": True,
+                "screenshot_delay_min": 5,
+                "screenshot_delay_max": 10,
+            }],
+            collectors,
+        )
+        self.assertEqual(["start", "close"], lifecycle)
+        self.assertEqual(4, checkpoint_write.call_count)
+        self.assertTrue(combined.is_file())
+        self.assertRegex(combined.name, r"^amex_air_all_batches_\d{8}_\d{6}_\d{6}\.xlsx$")
+        batches = list(output_dir.glob("amex_air_batch_1_*.xlsx"))
+        self.assertEqual(1, len(batches))
+        result_book = load_workbook(combined, read_only=True, data_only=True)
+        self.assertEqual(
+            (
+                "Prompt", "Status", "Response", "Parsed JSON", "Top 3 Blue Links",
+                "Execution Time (sec)", "SERP First Element", "AI Overview Position",
+                "AI Overview On Top", "SERP Order JSON", "AIO Ad Present", "AIO Ad Count",
+                "AIO Ads JSON", "Sponsored Ads JSON", "Sponsored Ad Count",
+                "AMEX Sponsored Ad Present", "AMEX Sponsored Ad Rank", "AMEX SERP Rank",
+                "Brands in Sponsored Ads", "AMEX Ad Competitive Position",
+            ),
+            tuple(cell.value for cell in result_book["Responses"][1]),
+        )
+        self.assertEqual(3, result_book["Responses"].max_row)
+        result_book.close()
+        self.assertEqual(2, len(screenshot_paths))
+        self.assertTrue(all(path.is_file() for path in screenshot_paths))
+        screenshot_dirs = list((output_dir / "screenshots").iterdir())
+        self.assertEqual(1, len(screenshot_dirs))
+        self.assertRegex(screenshot_dirs[0].name, r"^\d{8}_\d{6}$")
+        manifest = json.loads((screenshot_dirs[0] / "screenshot_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual({"one.png": "one", "two.png": "two"}, manifest)
+
+    def test_chrome_executable_discovery_uses_required_fallback_order(self):
+        from unittest.mock import patch
+
+        local_root = Path(self.temp.name) / "LocalAppData"
+        candidates = chrome_executable_candidates(local_root)
+        self.assertEqual(
+            [
+                Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+                local_root / "Google" / "Chrome" / "Application" / "chrome.exe",
+            ],
+            candidates,
+        )
+
+        for expected in candidates:
+            with self.subTest(expected=expected), patch.object(
+                Path,
+                "is_file",
+                autospec=True,
+                side_effect=lambda path, selected=expected: path == selected,
+            ), patch.object(Path, "resolve", autospec=True, side_effect=lambda path: path):
+                self.assertEqual(expected, find_chrome_executable(local_root))
+
+    def test_chrome_discovery_failure_lists_checked_locations(self):
+        from unittest.mock import patch
+
+        local_root = Path(self.temp.name) / "LocalAppData"
+        with patch.object(Path, "is_file", autospec=True, return_value=False):
+            with self.assertRaisesRegex(FileNotFoundError, "Google Chrome could not be found") as raised:
+                find_chrome_executable(local_root)
+        self.assertIn("Program Files", str(raised.exception))
+        self.assertIn(str(local_root), str(raised.exception))
+
+    def test_local_runner_uses_configured_pacing_and_long_break(self):
+        from unittest.mock import patch
+
+        prompt_path = Path(self.temp.name) / "pacing.txt"
+        prompt_path.write_text("\n".join(f"query {number}" for number in range(1, 12)), encoding="utf-8")
+
+        class FakeCollector:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def close(self):
+                pass
+
+            def collect(self, query, screenshot_path=None, captcha_screenshot_path=None):
+                return {
+                    "status": "Success", "response": query, "parsed_json": "{}",
+                    "top_blue_links": "[]", "google_blocked": False,
+                    "execution_time": 0.01,
+                }
+
+        settings = {
+            "AIR_LOCAL_MIN_DELAY": "25", "AIR_LOCAL_MAX_DELAY": "45",
+            "AIR_LOCAL_BREAK_EVERY": "10", "AIR_LOCAL_BREAK_MIN": "180",
+            "AIR_LOCAL_BREAK_MAX": "300",
+        }
+        with patch("air.local_runner.GoogleAIOverviewCollector", FakeCollector), \
+                patch("air.local_runner.random.uniform", side_effect=lambda low, high: (low + high) / 2) as uniform, \
+                patch("air.local_runner.time.sleep") as sleep, \
+                patch.dict("os.environ", settings):
+            run_local(
+                prompt_path,
+                Path(self.temp.name) / "pacing-output",
+                profile_dir=Path(self.temp.name) / "profile",
+                chrome_executable=self.chrome_executable,
+            )
+
+        self.assertEqual(10, uniform.call_count)
+        self.assertEqual([(25.0, 45.0)] * 9, [item.args for item in uniform.call_args_list[:9]])
+        self.assertEqual((180.0, 300.0), uniform.call_args_list[9].args)
+        self.assertEqual([35.0] * 9 + [240.0], [item.args[0] for item in sleep.call_args_list])
+
+    def test_local_captcha_retries_same_prompt_once_then_continues(self):
+        from unittest.mock import patch
+
+        prompt_path = Path(self.temp.name) / "retry.txt"
+        prompt_path.write_text("first\nsecond\n", encoding="utf-8")
+        calls = []
+        lifecycle = []
+        outcomes = [True, False, False]
+
+        class FakeCollector:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                lifecycle.append("start")
+
+            def close(self):
+                lifecycle.append("close")
+
+            def collect(self, query, screenshot_path=None, captcha_screenshot_path=None):
+                calls.append(query)
+                Path(screenshot_path).write_bytes(b"png")
+                blocked = outcomes.pop(0)
+                if blocked:
+                    Path(captcha_screenshot_path).write_bytes(b"captcha")
+                return {
+                    "status": "Failed" if blocked else "Success",
+                    "response": "blocked" if blocked else f"answer: {query}",
+                    "parsed_json": "", "top_blue_links": "[]",
+                    "google_blocked": blocked, "execution_time": 0.01,
+                }
+
+        with patch("air.local_runner.GoogleAIOverviewCollector", FakeCollector), \
+                patch("air.local_runner.time.sleep") as sleep:
+            combined = run_local(
+                prompt_path,
+                Path(self.temp.name) / "retry-output",
+                delay_min=0,
+                delay_max=0,
+                break_every=0,
+                captcha_wait_seconds=60,
+                profile_dir=Path(self.temp.name) / "profile",
+                chrome_executable=self.chrome_executable,
+            )
+
+        self.assertEqual(["first", "first", "second"], calls)
+        self.assertEqual(["start", "close"], lifecycle)
+        sleep.assert_called_once_with(60)
+        workbook = load_workbook(combined, read_only=True, data_only=True)
+        self.assertEqual(["Success", "Success"], [workbook["Responses"].cell(row, 2).value for row in (2, 3)])
+        workbook.close()
+        screenshot_dir = next((Path(self.temp.name) / "retry-output" / "screenshots").iterdir())
+        normal_screenshots = [
+            path for path in screenshot_dir.glob("*.png")
+            if not path.name.startswith("CAPTCHA_")
+        ]
+        self.assertEqual(["first.png", "second.png"], sorted(path.name for path in normal_screenshots))
+
+    def test_persistent_captcha_stops_and_saves_partial_output_and_screenshots(self):
+        from unittest.mock import patch
+
+        prompt_path = Path(self.temp.name) / "stop.txt"
+        prompt_path.write_text("completed\nblocked\nnever run\n", encoding="utf-8")
+        calls = []
+        outcomes = [False, True, True]
+
+        class FakeCollector:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def close(self):
+                pass
+
+            def collect(self, query, screenshot_path=None, captcha_screenshot_path=None):
+                calls.append(query)
+                Path(screenshot_path).write_bytes(b"png")
+                blocked = outcomes.pop(0)
+                if blocked:
+                    Path(captcha_screenshot_path).write_bytes(b"captcha")
+                return {
+                    "status": "Failed" if blocked else "Success",
+                    "response": "Google CAPTCHA" if blocked else "answer",
+                    "parsed_json": "", "top_blue_links": "[]",
+                    "google_blocked": blocked, "execution_time": 0.01,
+                }
+
+        output_dir = Path(self.temp.name) / "stop-output"
+        with patch("air.local_runner.GoogleAIOverviewCollector", FakeCollector), \
+                patch("air.local_runner.time.sleep") as sleep:
+            combined = run_local(
+                prompt_path,
+                output_dir,
+                delay_min=0,
+                delay_max=0,
+                break_every=0,
+                captcha_wait_seconds=60,
+                profile_dir=Path(self.temp.name) / "profile",
+                chrome_executable=self.chrome_executable,
+            )
+
+        self.assertEqual(["completed", "blocked", "blocked"], calls)
+        sleep.assert_called_once_with(60)
+        workbook = load_workbook(combined, read_only=True, data_only=True)
+        sheet = workbook["Responses"]
+        self.assertEqual(3, sheet.max_row)
+        self.assertEqual("completed", sheet.cell(2, 1).value)
+        self.assertEqual("blocked", sheet.cell(3, 1).value)
+        self.assertEqual("Failed", sheet.cell(3, 2).value)
+        workbook.close()
+        screenshot_dir = next((output_dir / "screenshots").iterdir())
+        captcha_files = list(screenshot_dir.glob("CAPTCHA_*.png"))
+        self.assertEqual(2, len(captcha_files))
+        manifest = json.loads((screenshot_dir / "screenshot_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(2, len([name for name in manifest if name.startswith("CAPTCHA_")]))
+
+    def test_local_profile_path_is_reused_across_runs(self):
+        from unittest.mock import patch
+
+        prompt_path = Path(self.temp.name) / "profile.txt"
+        prompt_path.write_text("one\n", encoding="utf-8")
+        profile_dir = Path(self.temp.name) / "shared-profile"
+        profiles = []
+
+        class FakeCollector:
+            def __init__(self, **kwargs):
+                profiles.append(kwargs["user_data_dir"])
+
+            def start(self):
+                pass
+
+            def close(self):
+                pass
+
+            def collect(self, query, screenshot_path=None, captcha_screenshot_path=None):
+                return {
+                    "status": "Success", "response": query, "parsed_json": "{}",
+                    "top_blue_links": "[]", "google_blocked": False,
+                    "execution_time": 0.01,
+                }
+
+        with patch("air.local_runner.GoogleAIOverviewCollector", FakeCollector):
+            for run_number in (1, 2):
+                run_local(
+                    prompt_path,
+                    Path(self.temp.name) / f"profile-output-{run_number}",
+                    delay_min=0,
+                    delay_max=0,
+                    break_every=0,
+                    profile_dir=profile_dir,
+                    chrome_executable=self.chrome_executable,
+                )
+        self.assertEqual([str(profile_dir), str(profile_dir)], profiles)
+        self.assertTrue(profile_dir.is_dir())
+
+    def test_screenshot_filenames_folders_duplicates_and_manifest(self):
+        root = Path(self.temp.name) / "qc-output"
+        screenshots = ScreenshotRun(root, timestamp="20260910_194500")
+        self.assertEqual(root / "screenshots" / "20260910_194500", screenshots.directory)
+
+        unsafe_prompt = ' best card: Amex / Chase? * "offer" <now> |. '
+        first = screenshots.path_for(unsafe_prompt)
+        duplicate = screenshots.path_for(unsafe_prompt)
+        case_duplicate = screenshots.path_for("BEST CARD AMEX CHASE OFFER NOW")
+        long_path = screenshots.path_for("x" * 500)
+
+        self.assertEqual("best card Amex Chase offer now.png", first.name)
+        self.assertEqual("best card Amex Chase offer now_2.png", duplicate.name)
+        self.assertEqual("BEST CARD AMEX CHASE OFFER NOW_3.png", case_duplicate.name)
+        self.assertLessEqual(len(long_path.name), 180)
+        self.assertFalse(first.name.endswith(". .png"))
+
+        first.write_bytes(b"png")
+        screenshots.record(first, unsafe_prompt)
+        manifest = json.loads((screenshots.directory / "screenshot_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(unsafe_prompt, manifest[first.name])
+
+        second_run = ScreenshotRun(root, timestamp="20260910_194500")
+        self.assertEqual("20260910_194500_2", second_run.directory.name)
+
+    def test_screenshot_sanitizer_handles_empty_reserved_and_trailing_periods(self):
+        self.assertEqual("prompt", sanitize_screenshot_stem('\\/:*?"<>|'))
+        self.assertEqual("_CON", sanitize_screenshot_stem("CON"))
+        self.assertEqual("trailing", sanitize_screenshot_stem(" trailing... "))
+
+    def test_screenshot_failure_does_not_raise(self):
+        class BrokenPage:
+            def screenshot(self, **_kwargs):
+                raise RuntimeError("capture failed")
+
+        path = Path(self.temp.name) / "unavailable.png"
+        self.assertFalse(save_qc_screenshot(BrokenPage(), path))
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

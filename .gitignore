@@ -5,3 +5,7 @@ output/
 .venv/
 .pytest_cache/
 .tools/
+/debug/local_browser_profile/
+/debug/
+/.local-*/
+/prompts.xlsx
